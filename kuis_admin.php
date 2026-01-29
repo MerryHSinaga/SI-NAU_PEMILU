@@ -7,17 +7,16 @@ if (empty($_SESSION["admin"])) {
   exit;
 }
 
-/* =======================
-   KONFIG DATABASE
-======================= */
 $DB_HOST = "localhost";
 $DB_NAME = "sinau_pemilu";
 $DB_USER = "root";
 $DB_PASS = "";
 
-/* =======================
-   DB CONNECT
-======================= */
+$UPLOAD_DIR = __DIR__ . "/uploads/materi";
+$UPLOAD_URL = "uploads/materi";
+
+if (!is_dir($UPLOAD_DIR)) { @mkdir($UPLOAD_DIR, 0775, true); }
+
 function db(): PDO {
   global $DB_HOST, $DB_NAME, $DB_USER, $DB_PASS;
   static $pdo = null;
@@ -31,392 +30,153 @@ function db(): PDO {
   return $pdo;
 }
 
-/* =======================
-   TABLES + MIGRATION
-======================= */
-function ensure_tables(): void {
-  db()->exec("
-    CREATE TABLE IF NOT EXISTS kuis_paket (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      judul VARCHAR(255) NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  ");
+function safe_name(string $ext): string {
+  $ext = strtolower($ext);
+  return "materi_" . date("Ymd_His") . "_" . bin2hex(random_bytes(6)) . "." . $ext;
+}
 
-  // tambah kolom input_mode jika belum ada (csv/manual)
-  try {
-    db()->exec("ALTER TABLE kuis_paket ADD COLUMN input_mode ENUM('csv','manual') NOT NULL DEFAULT 'csv' AFTER judul");
-  } catch (Throwable $e) {
-    // abaikan kalau kolom sudah ada
+function count_pdf_pages(string $pdfPath): int {
+  $pdfinfo = @shell_exec("pdfinfo " . escapeshellarg($pdfPath) . " 2>/dev/null");
+  if (is_string($pdfinfo) && $pdfinfo !== "" && preg_match('/Pages:\s+(\d+)/i', $pdfinfo, $m)) {
+    return (int)$m[1];
   }
-
-  db()->exec("
-    CREATE TABLE IF NOT EXISTS kuis_soal (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      paket_id INT NOT NULL,
-      nomor INT NOT NULL,
-      pertanyaan TEXT NOT NULL,
-      opsi_a VARCHAR(255) NOT NULL,
-      opsi_b VARCHAR(255) NOT NULL,
-      opsi_c VARCHAR(255) NOT NULL,
-      opsi_d VARCHAR(255) NOT NULL,
-      jawaban ENUM('A','B','C','D') NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_paket_nomor (paket_id, nomor),
-      CONSTRAINT fk_soal_paket FOREIGN KEY (paket_id) REFERENCES kuis_paket(id)
-        ON DELETE CASCADE ON UPDATE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  ");
-}
-
-function paket_create(string $judul, string $mode): int {
-  $judul = trim($judul);
-  $mode = strtolower(trim($mode));
-  if ($judul === "") throw new RuntimeException("Judul kuis wajib diisi.");
-  if (!in_array($mode, ["csv","manual"], true)) $mode = "csv";
-
-  $st = db()->prepare("INSERT INTO kuis_paket (judul, input_mode) VALUES (?, ?)");
-  $st->execute([$judul, $mode]);
-  return (int)db()->lastInsertId();
-}
-
-function paket_update(int $id, string $judul, ?string $mode = null): void {
-  $judul = trim($judul);
-  if ($id <= 0) throw new RuntimeException("ID paket tidak valid.");
-  if ($judul === "") throw new RuntimeException("Judul kuis wajib diisi.");
-
-  if ($mode !== null) {
-    $mode = strtolower(trim($mode));
-    if (!in_array($mode, ["csv","manual"], true)) $mode = "csv";
-    $st = db()->prepare("UPDATE kuis_paket SET judul=?, input_mode=? WHERE id=?");
-    $st->execute([$judul, $mode, $id]);
-    return;
+  $content = @file_get_contents($pdfPath);
+  if (is_string($content) && $content !== "") {
+    $n = preg_match_all("/\/Type\s*\/Page\b/", $content);
+    if ($n > 0) return (int)$n;
   }
-
-  $st = db()->prepare("UPDATE kuis_paket SET judul=? WHERE id=?");
-  $st->execute([$judul, $id]);
+  return 1;
 }
 
-function soal_upsert(
-  int $paketId,
-  int $nomor,
-  string $pertanyaan,
-  string $a,
-  string $b,
-  string $c,
-  string $d,
-  string $jawaban
-): void {
-  if ($paketId <= 0) throw new RuntimeException("Paket ID tidak valid.");
-  if ($nomor < 1 || $nomor > 15) throw new RuntimeException("Nomor soal harus 1 - 15.");
+function upload_one_pdf(array $file, int $maxBytes, string $destDir): array {
+  if (!isset($file["tmp_name"]) || !is_uploaded_file($file["tmp_name"])) return [false,"","File wajib diupload."];
+  if (($file["error"] ?? UPLOAD_ERR_OK) !== UPLOAD_ERR_OK) return [false,"","Upload gagal."];
+  if (($file["size"] ?? 0) > $maxBytes) return [false,"","Ukuran file terlalu besar (maks 500KB)."];
 
-  $pertanyaan = trim($pertanyaan);
-  $a = trim($a); $b = trim($b); $c = trim($c); $d = trim($d);
-  $jawaban = strtoupper(trim($jawaban));
+  $ext = strtolower(pathinfo((string)($file["name"] ?? ""), PATHINFO_EXTENSION));
+  if ($ext !== "pdf") return [false,"","Tipe file tidak sesuai (wajib PDF)."];
 
-  // skip jika kosong semua (biar bulk aman)
-  if ($pertanyaan === "" && $a === "" && $b === "" && $c === "" && $d === "" && $jawaban === "") return;
+  $finfo = new finfo(FILEINFO_MIME_TYPE);
+  $mime = $finfo->file($file["tmp_name"]);
+  if (!in_array($mime, ["application/pdf","application/x-pdf"], true)) return [false,"","File tidak valid (bukan PDF)."];
 
-  if ($pertanyaan === "" || $a === "" || $b === "" || $c === "" || $d === "") {
-    throw new RuntimeException("Nomor {$nomor}: Pertanyaan dan semua pilihan wajib diisi.");
+  $name = safe_name("pdf");
+  $path = rtrim($destDir,"/") . "/" . $name;
+
+  if (!move_uploaded_file($file["tmp_name"], $path)) return [false,"","Gagal menyimpan file."];
+  return [true,$name,""];
+}
+
+function remove_media_files(int $materiId): void {
+  global $UPLOAD_DIR;
+  $st = db()->prepare("SELECT file_path FROM materi_media WHERE materi_id=?");
+  $st->execute([$materiId]);
+  foreach ($st->fetchAll() as $f) {
+    $p = $UPLOAD_DIR . "/" . $f["file_path"];
+    if (is_file($p)) @unlink($p);
   }
-  if (!in_array($jawaban, ["A","B","C","D"], true)) {
-    throw new RuntimeException("Nomor {$nomor}: Jawaban harus A/B/C/D.");
-  }
-
-  $sql = "
-    INSERT INTO kuis_soal (paket_id, nomor, pertanyaan, opsi_a, opsi_b, opsi_c, opsi_d, jawaban)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      pertanyaan=VALUES(pertanyaan),
-      opsi_a=VALUES(opsi_a),
-      opsi_b=VALUES(opsi_b),
-      opsi_c=VALUES(opsi_c),
-      opsi_d=VALUES(opsi_d),
-      jawaban=VALUES(jawaban)
-  ";
-  $st = db()->prepare($sql);
-  $st->execute([$paketId, $nomor, $pertanyaan, $a, $b, $c, $d, $jawaban]);
+  db()->prepare("DELETE FROM materi_media WHERE materi_id=?")->execute([$materiId]);
 }
 
-/* =======================
-   CSV PARSER + VALIDATOR
-   (Agar paket tidak dibuat kalau CSV kosong)
-======================= */
-function csv_parse_valid_rows(string $tmpPath): array {
-  $fh = fopen($tmpPath, "r");
-  if (!$fh) throw new RuntimeException("Gagal membaca CSV.");
-
-  $rows = [];
-  $line = 0;
-
-  try {
-    while (($row = fgetcsv($fh)) !== false) {
-      $line++;
-
-      // normalisasi (trim semua kolom)
-      $row = array_map(static fn($v) => is_string($v) ? trim($v) : "", $row);
-
-      // skip baris benar-benar kosong
-      $allEmpty = true;
-      foreach ($row as $v) {
-        if ((string)$v !== "") { $allEmpty = false; break; }
-      }
-      if ($allEmpty) continue;
-
-      // minimal 7 kolom
-      if (count($row) < 7) {
-        throw new RuntimeException("CSV baris {$line}: kolom kurang. Wajib 7 kolom (nomor, pertanyaan, opsi_a, opsi_b, opsi_c, opsi_d, jawaban).");
-      }
-
-      // skip header (baris pertama) jika kolom 1 bukan angka
-      if ($line === 1 && !ctype_digit((string)$row[0])) {
-        continue;
-      }
-
-      $nomor = (int)$row[0];
-      $pertanyaan = (string)$row[1];
-      $a = (string)$row[2];
-      $b = (string)$row[3];
-      $c = (string)$row[4];
-      $d = (string)$row[5];
-      $jawaban = strtoupper((string)$row[6]);
-
-      // jika satu baris data ternyata kosong semua (kadang terjadi)
-      if (
-        trim((string)$row[0]) === "" &&
-        trim($pertanyaan) === "" &&
-        trim($a) === "" && trim($b) === "" && trim($c) === "" && trim($d) === "" &&
-        trim($jawaban) === ""
-      ) {
-        continue;
-      }
-
-      // validasi nomor
-      if (!ctype_digit((string)$row[0])) {
-        throw new RuntimeException("CSV baris {$line}: kolom 'nomor' harus angka.");
-      }
-      if ($nomor < 1 || $nomor > 15) {
-        throw new RuntimeException("CSV baris {$line}: nomor soal harus 1–15.");
-      }
-
-      // validasi isi wajib
-      if (trim($pertanyaan) === "" || trim($a) === "" || trim($b) === "" || trim($c) === "" || trim($d) === "") {
-        throw new RuntimeException("CSV baris {$line} (nomor {$nomor}): pertanyaan & semua opsi (A–D) wajib diisi.");
-      }
-
-      // validasi jawaban
-      if (!in_array($jawaban, ["A","B","C","D"], true)) {
-        throw new RuntimeException("CSV baris {$line} (nomor {$nomor}): jawaban harus A/B/C/D.");
-      }
-
-      $rows[] = [
-        "nomor" => $nomor,
-        "pertanyaan" => $pertanyaan,
-        "a" => $a,
-        "b" => $b,
-        "c" => $c,
-        "d" => $d,
-        "jawaban" => $jawaban,
-        "line" => $line,
-      ];
-    }
-  } finally {
-    fclose($fh);
-  }
-
-  // kalau kosong (mis. hanya header / baris kosong)
-  if (count($rows) === 0) {
-    throw new RuntimeException("CSV tidak berisi soal. Pastikan ada minimal 1 soal untuk ditambahkan.");
-  }
-
-  return $rows;
-}
-
-ensure_tables();
-
-/* =======================
-   DOWNLOAD: TEMPLATE CSV
-======================= */
-if (isset($_GET["download"]) && $_GET["download"] === "template_csv") {
-  $filename = "template_kuis.csv";
-  header("Content-Type: text/csv; charset=utf-8");
-  header("Content-Disposition: attachment; filename=\"{$filename}\"");
-  header("Pragma: no-cache");
-  header("Expires: 0");
-
-  $out = fopen("php://output", "w");
-  if ($out === false) exit;
-
-  fputcsv($out, ["nomor","pertanyaan","opsi_a","opsi_b","opsi_c","opsi_d","jawaban"]);
-  fputcsv($out, ["1","Contoh pertanyaan?","Opsi A","Opsi B","Opsi C","Opsi D","A"]);
-
-  fclose($out);
-  exit;
-}
-
-/* =======================
-   AJAX: DETAIL PAKET
-======================= */
-if (isset($_GET["ajax"]) && $_GET["ajax"] === "paket_detail") {
-  header("Content-Type: application/json; charset=utf-8");
-  $id = (int)($_GET["id"] ?? 0);
-  if ($id <= 0) { echo json_encode(["ok"=>false]); exit; }
-
-  $p = db()->prepare("SELECT id, judul, input_mode FROM kuis_paket WHERE id=?");
-  $p->execute([$id]);
-  $paket = $p->fetch();
-  if (!$paket) { echo json_encode(["ok"=>false]); exit; }
-
-  $soal = db()->prepare("SELECT nomor, pertanyaan, opsi_a, opsi_b, opsi_c, opsi_d, jawaban
-                         FROM kuis_soal WHERE paket_id=? ORDER BY nomor ASC");
-  $soal->execute([$id]);
-  $rows = $soal->fetchAll();
-
-  echo json_encode([
-    "ok"=>true,
-    "paket"=>[
-      "id" => (int)$paket["id"],
-      "judul" => (string)$paket["judul"],
-      "input_mode" => (string)$paket["input_mode"],
-    ],
-    "soal"=>$rows
-  ]);
-  exit;
-}
-
-/* =======================
-   POST HANDLER
-======================= */
 $toast = ["type"=>"", "msg"=>""];
+$lastAction = "";
 
 try {
   if ($_SERVER["REQUEST_METHOD"] === "POST") {
     $action = (string)($_POST["action"] ?? "");
+    $lastAction = $action;
 
-    if ($action === "paket_delete") {
-      $id = (int)($_POST["paket_id"] ?? 0);
-      if ($id <= 0) throw new RuntimeException("ID paket tidak valid.");
-      db()->prepare("DELETE FROM kuis_paket WHERE id=?")->execute([$id]);
-      $toast = ["type"=>"success","msg"=>"Paket kuis berhasil dihapus."];
-    }
+    if ($action === "add" || $action === "edit") {
+      $judul = trim((string)($_POST["judul"] ?? ""));
+      $mode  = (string)($_POST["mode"] ?? "pdf");
 
-    // ==========================
-    // MANUAL SAVE (boleh untuk paket CSV juga)
-    // ==========================
-    if ($action === "soal_save_bulk") {
-      $paketId = (int)($_POST["paket_id"] ?? 0);
-      $judulPaket = (string)($_POST["judul_paket"] ?? "");
+      if ($judul === "") throw new RuntimeException("Judul wajib diisi.");
+      if ($mode !== "pdf") throw new RuntimeException("Materi hanya boleh dalam bentuk PDF.");
 
       db()->beginTransaction();
 
-      if ($paketId <= 0) {
-        $paketId = paket_create($judulPaket, "manual");
+      if ($action === "add") {
+        db()->prepare("INSERT INTO materi (judul, tipe, jumlah_slide) VALUES (?, 'pdf', 0)")
+          ->execute([$judul]);
+        $materiId = (int)db()->lastInsertId();
       } else {
-        // ✅ saat simpan manual: set mode jadi manual
-        paket_update($paketId, $judulPaket, "manual");
+        $materiId = (int)($_POST["id"] ?? 0);
+        if ($materiId <= 0) throw new RuntimeException("ID tidak valid.");
+
+        $st = db()->prepare("SELECT tipe FROM materi WHERE id=?");
+        $st->execute([$materiId]);
+        $row = $st->fetch();
+        if (!$row) throw new RuntimeException("Materi tidak ditemukan.");
+        if ((string)$row["tipe"] !== "pdf") throw new RuntimeException("Tipe materi tidak valid di database.");
+
+        db()->prepare("UPDATE materi SET judul=? WHERE id=?")
+          ->execute([$judul, $materiId]);
       }
 
-      $bulkJson = (string)($_POST["bulk_json"] ?? "");
-      if ($bulkJson === "") throw new RuntimeException("Data soal (bulk) kosong.");
+      $hasNewPdf = isset($_FILES["pdf"]) && ($_FILES["pdf"]["error"] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK;
+      $shouldReplaceMedia = ($action === "add") || $hasNewPdf;
 
-      $bulk = json_decode($bulkJson, true);
-      if (!is_array($bulk)) throw new RuntimeException("Format bulk_json tidak valid.");
+      if ($shouldReplaceMedia) {
+        if (!$hasNewPdf) throw new RuntimeException("Silakan pilih file PDF.");
 
-      $saved = 0;
-      foreach ($bulk as $noStr => $d) {
-        $no = (int)$noStr;
-        if (!is_array($d)) continue;
+        remove_media_files($materiId);
 
-        soal_upsert(
-          $paketId,
-          $no,
-          (string)($d["pertanyaan"] ?? ""),
-          (string)($d["a"] ?? ""),
-          (string)($d["b"] ?? ""),
-          (string)($d["c"] ?? ""),
-          (string)($d["d"] ?? ""),
-          (string)($d["jawaban"] ?? "")
-        );
+        [$ok,$fn,$err] = upload_one_pdf($_FILES["pdf"] ?? [], 500*1024, $UPLOAD_DIR);
+        if (!$ok) throw new RuntimeException($err);
 
-        if (trim((string)($d["pertanyaan"] ?? "")) !== "") $saved++;
+        $pages = count_pdf_pages($UPLOAD_DIR . "/" . $fn);
+
+        db()->prepare("INSERT INTO materi_media (materi_id, file_path, sort_order) VALUES (?, ?, 0)")
+          ->execute([$materiId, $fn]);
+
+        db()->prepare("UPDATE materi SET jumlah_slide=? WHERE id=?")
+          ->execute([$pages, $materiId]);
       }
 
       db()->commit();
-      $toast = ["type"=>"success","msg"=>"Soal berhasil disimpan (Manual). Total terisi: {$saved} (maks 15)."];
+
+      if ($action === "add") $toast = ["type"=>"success","msg"=>"Berhasil menambahkan " . $judul];
+      else $toast = ["type"=>"success","msg"=>"Berhasil memperbarui " . $judul];
     }
 
-    // ==========================
-    // CSV IMPORT (mode jadi csv)
-    // ✅ REVISI: Jangan buat paket kalau CSV kosong/tidak ada data valid
-    // ==========================
-    if ($action === "csv_import") {
-      $paketId = (int)($_POST["paket_id"] ?? 0);
-      $judulPaket = (string)($_POST["judul_paket"] ?? "");
+    if ($action === "delete") {
+      $id = (int)($_POST["id"] ?? 0);
+      if ($id <= 0) throw new RuntimeException("ID tidak valid.");
 
-      // validasi upload dulu (tanpa bikin paket)
-      if (!isset($_FILES["csv"]) || !is_uploaded_file($_FILES["csv"]["tmp_name"])) {
-        throw new RuntimeException("File CSV wajib diupload.");
-      }
+      remove_media_files($id);
+      db()->prepare("DELETE FROM materi WHERE id=?")->execute([$id]);
 
-      // parse + validasi isi CSV dulu (kalau kosong => throw, paket tidak jadi dibuat)
-      $parsedRows = csv_parse_valid_rows($_FILES["csv"]["tmp_name"]);
-
-      db()->beginTransaction();
-
-      // baru bikin / update paket setelah dipastikan CSV ada isinya
-      if ($paketId <= 0) {
-        $paketId = paket_create($judulPaket, "csv");
-      } else {
-        // ✅ saat import csv: set mode jadi csv
-        paket_update($paketId, $judulPaket, "csv");
-      }
-
-      $saved = 0;
-      foreach ($parsedRows as $r) {
-        soal_upsert(
-          $paketId,
-          (int)$r["nomor"],
-          (string)$r["pertanyaan"],
-          (string)$r["a"],
-          (string)$r["b"],
-          (string)$r["c"],
-          (string)$r["d"],
-          (string)$r["jawaban"]
-        );
-        $saved++;
-      }
-
-      db()->commit();
-      $toast = ["type"=>"success","msg"=>"Import CSV berhasil. Total soal: {$saved} (maks 15)."];
+      $toast = ["type"=>"success","msg"=>"Materi berhasil dihapus."];
     }
   }
 } catch (Throwable $e) {
   if (db()->inTransaction()) db()->rollBack();
-  $toast = ["type"=>"danger","msg"=>$e->getMessage()];
+
+  $reason = $e->getMessage();
+  if ($lastAction === "edit") $toast = ["type"=>"danger","msg"=>"Gagal memperbarui materi karena " . $reason];
+  else $toast = ["type"=>"danger","msg"=>"Gagal menambahkan materi karena " . $reason];
 }
 
-/* =======================
-   LOAD DATA
-======================= */
-$paket = db()->query("
-  SELECT p.id, p.judul, p.input_mode,
-         (SELECT COUNT(*) FROM kuis_soal s WHERE s.paket_id=p.id) AS jumlah_soal
-  FROM kuis_paket p
-  ORDER BY p.id DESC
-")->fetchAll();
+$rows = db()->query("SELECT * FROM materi ORDER BY id DESC")->fetchAll();
+
+$mediaByMateri = [];
+$st = db()->query("SELECT materi_id, file_path, sort_order FROM materi_media ORDER BY materi_id DESC, sort_order ASC, id ASC");
+foreach ($st->fetchAll() as $m) {
+  $mid = (int)$m["materi_id"];
+  $mediaByMateri[$mid] ??= [];
+  $mediaByMateri[$mid][] = $m["file_path"];
+}
 ?>
 <!doctype html>
 <html lang="id">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Daftar Soal | Admin</title>
+  <title>Daftar Materi | DIY</title>
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
@@ -428,11 +188,12 @@ $paket = db()->query("
       --header-gray:#d9d9d9;
       --row-line:#e6e6e6;
       --shadow:0 14px 22px rgba(0,0,0,.18);
+      --gold:#f4c430;
     }
 
     body{
       margin:0;
-      font-family:'Inter',system-ui,-apple-system,sans-serif;
+      font-family:'Inter';
       background:var(--bg);
       min-height:100vh;
       display:flex;
@@ -441,14 +202,22 @@ $paket = db()->query("
 
     .bg-maroon{background:var(--maroon)!important}
     .navbar{padding:20px 0;border-bottom:1px solid rgba(0,0,0,.15);}
-    .navbar-nav-simple{list-style:none;display:flex;align-items:center;gap:46px;margin:0;padding:0;}
-    .navbar-nav-simple .nav-link{color:#fff;font-weight:800;letter-spacing:.5px;text-decoration:none;position:relative;padding:6px 0 12px;}
-    .navbar-nav-simple .nav-link::after{
-      content:"";position:absolute;left:0;right:0;margin:auto;bottom:0;
-      width:0;height:3px;background:#fff;border-radius:2px;transition:.25s ease;opacity:.95;
+
+    /* ✅ LOGOUT STYLE (SAMA SEPERTI DASHBOARD) */
+    .nav-link{color:#fff !important;font-weight:500;}
+    .nav-hover{position:relative;padding-bottom:6px;}
+    .nav-hover::after{
+      content:"";
+      position:absolute;
+      left:0;
+      bottom:0;
+      width:0;
+      height:3px;
+      background:var(--gold);
+      transition:0.3s ease;
     }
-    .navbar-nav-simple .nav-link:hover::after{width:70px;}
-    .navbar-nav-simple .nav-link.active::after{width:70px;}
+    .nav-hover:hover::after,
+    .nav-active::after{width:100%;}
 
     .page{
       max-width:1200px;
@@ -463,7 +232,7 @@ $paket = db()->query("
 
     .btn-add{
       border:0;background:var(--maroon);color:#fff;
-      font-weight:700;font-size:14px;
+      font-weight:600;font-size:14px;
       padding:12px 34px;border-radius:999px;
       display:inline-flex;align-items:center;gap:10px;white-space:nowrap;
       box-shadow:0 10px 18px rgba(0,0,0,.18);
@@ -477,6 +246,16 @@ $paket = db()->query("
       margin-top:44px;background:#fff;border-radius:26px;overflow:hidden;
       box-shadow:var(--shadow);max-width:980px;margin-left:auto;margin-right:auto;
     }
+
+    /* ✅ BARU: tabel bisa discroll horizontal di mobile */
+    .table-scroll{
+      overflow-x:auto;
+      -webkit-overflow-scrolling:touch;
+    }
+    .table-grid{
+      min-width:860px;
+    }
+
     .table-head{
       background:var(--header-gray);padding:18px 34px;
       display:grid;grid-template-columns:90px 1fr 220px 90px;align-items:center;
@@ -497,86 +276,71 @@ $paket = db()->query("
     .icon-btn:hover{background:rgba(112,13,9,.08);transform:translateY(-1px);}
     .icon-edit,.icon-trash{color:var(--maroon);font-size:22px;}
 
-    .mode-badge{
-      display:inline-flex;align-items:center;gap:8px;
-      font-size:12px;font-weight:900;
-      padding:6px 12px;border-radius:999px;
-      border:2px solid rgba(112,13,9,.25);
-      background:#fff;
-      color:#111;
-      margin-left:10px;
+    /* ===== MODAL ===== */
+    .label-plain{font-weight:600;font-size:14px;color:#111;margin-bottom:8px;}
+    .input-pill{
+      border:2px solid #111;border-radius:999px;
+      padding:10px 18px;font-size:13px;outline:none;width:min(520px,100%);
     }
 
-    .modal-content{border:0;border-radius:28px;overflow:hidden;box-shadow:0 30px 60px rgba(0,0,0,.28);}
-    .modal-header-custom{background:var(--maroon);padding:22px 28px 16px;position:relative;}
-    .modal-title-custom{margin:0;color:#fff;font-weight:900;font-size:34px;line-height:1.05;}
+    .modal-dialog{ max-width:680px; }
+    .modal-content{
+      border:0;border-radius:28px;overflow:hidden;
+      box-shadow:0 30px 60px rgba(0,0,0,.30);
+    }
+    .modal-header-custom{
+      background:var(--maroon);
+      padding:22px 28px 16px;
+      position:relative;
+    }
+    .modal-title-custom{margin:0;color:#fff;font-weight:800;font-size:28px;line-height:1.05;}
     .modal-subtitle-custom{margin-top:6px;color:rgba(255,255,255,.85);font-style:italic;font-size:13px;}
     .modal-close-x{
-      position:absolute;top:16px;right:18px;width:44px;height:44px;border-radius:12px;border:0;
-      background:transparent;color:#fff;font-size:30px;display:flex;align-items:center;justify-content:center;
-      opacity:.95;transition:opacity .15s ease, transform .15s ease;
+      position:absolute;top:16px;right:18px;width:44px;height:44px;border-radius:12px;
+      border:0;background:transparent;color:#fff;font-size:30px;display:flex;
+      align-items:center;justify-content:center;opacity:.95;
     }
-    .modal-close-x:hover{opacity:1;transform:scale(1.03);}
 
     .modal-body{
-      padding:18px 24px 22px;
+      padding:22px 28px 26px;
       background:#fff;
-      max-height:calc(100vh - 240px);
+      max-height:70vh;
       overflow:auto;
     }
 
-    .pill-input{border:2px solid #111;border-radius:999px;padding:10px 16px;font-size:14px;outline:none;width:100%;}
-    textarea.big{border:2px solid #111;border-radius:18px;padding:12px 14px;font-size:14px;outline:none;width:100%;min-height:130px;resize:vertical;}
-
-    .mode-switch{width:180px;background:#d9d9d9;border-radius:999px;padding:6px;display:flex;gap:6px;user-select:none;}
-    .mode-pill{flex:1;border-radius:999px;padding:8px 0;text-align:center;font-weight:900;cursor:pointer;color:#fff;font-size:13px;}
-    .mode-pill.inactive{opacity:.55;background:transparent;color:#fff;}
-    .mode-pill.active{background:var(--maroon);}
-
-    .numbers{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;}
-    .num-btn{width:40px;height:40px;border-radius:999px;border:2px solid #111;background:#fff;font-weight:900;cursor:pointer;}
-    .num-btn.active{background:#e9edff;}
-    .num-btn.filled{border-color:var(--maroon);}
+    .pdf-preview-box{
+      margin-top:12px;background:#d9d9d9;border-radius:18px;padding:14px;
+    }
+    .pdf-meta{
+      display:flex;align-items:center;justify-content:space-between;gap:10px;
+      margin-bottom:10px;color:#111;font-size:12px;font-weight:800;
+    }
+    .pdf-canvas-wrap{
+      background:#fff;border-radius:14px;overflow:hidden;
+      box-shadow:0 10px 18px rgba(0,0,0,.10);
+    }
+    #pdfCanvas{display:block;width:100%;height:auto;}
+    .pdf-fallback{
+      width:100%;
+      height:360px;
+      border:0;
+      display:none;
+      background:#fff;
+    }
 
     .dropzone{
-      margin-top:14px;height:170px;border-radius:18px;background:#d9d9d9;border:2px dashed rgba(112,13,9,.25);
+      margin-top:12px;height:150px;border-radius:18px;background:#d9d9d9;border:2px dashed rgba(112,13,9,.25);
       display:flex;align-items:center;justify-content:center;text-align:center;cursor:pointer;
+      padding:12px;
     }
     .dropzone.dragover{outline:3px solid rgba(112,13,9,.35);}
-    .dropzone .dz-icon{font-size:50px;color:#fff;}
-    .dropzone .dz-text{color:#fff;font-size:14px;font-weight:800;}
+    .dropzone .dz-icon{font-size:42px;color:#fff;}
+    .dropzone .dz-text{color:#fff;font-size:13px;font-weight:800;word-break:break-word;}
 
-    .ans-grid{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;}
-    .ans-item{display:flex;align-items:center;gap:8px;border:2px solid #111;border-radius:999px;padding:10px 14px;cursor:pointer;user-select:none;}
-    .ans-item input{accent-color: var(--maroon); transform:scale(1.05);}
-    .ans-item.active{border-color:var(--maroon); background:#f3e9e9;}
-
-    .actions{display:flex;justify-content:flex-end;gap:12px;margin-top:16px;}
-    .btn-save{border:0;background:var(--maroon);color:#fff;font-weight:900;font-size:14px;padding:12px 34px;border-radius:14px;}
-    .btn-outline{border:2px solid #111;background:#fff;color:#111;font-weight:800;font-size:14px;padding:12px 34px;border-radius:14px;}
-
-    .tpl-link{
-      display:inline-flex;align-items:center;gap:8px;
-      font-weight:900;font-size:12px;
-      color:#333;text-decoration:none;
-      padding:6px 10px;border-radius:999px;
-      background:#f3f3f3;border:1px solid rgba(0,0,0,.12);
-      transition:transform .15s ease, filter .15s ease;
-    }
-    .tpl-link:hover{filter:brightness(.98);transform:translateY(-1px);}
-
-    .info-max{
-      margin-top:8px;
-      font-size:12px;
-      font-weight:900;
-      color:#700D09;
-      background:rgba(112,13,9,.08);
-      border:1px solid rgba(112,13,9,.18);
-      padding:8px 10px;
-      border-radius:12px;
-      display:inline-flex;
-      align-items:center;
-      gap:8px;
+    .actions-row{display:flex;justify-content:flex-end;margin-top:16px;gap:10px;flex-wrap:wrap;}
+    .btn-save{
+      border:0;background:var(--maroon);color:#fff;font-weight:800;font-size:14px;
+      padding:12px 44px;border-radius:14px;
     }
 
     .btn-back{
@@ -589,12 +353,35 @@ $paket = db()->query("
     .btn-back:hover{filter:brightness(1.05);transform:translateY(-1px);}
     .btn-back i{font-size:22px;line-height:1;}
 
+    /* ✅ tablet */
     @media (max-width: 992px){
-      .navbar-nav-simple{display:none;}
       .title{font-size:40px;}
       .table-wrap{max-width:100%;}
-      .table-head,.table-row{grid-template-columns:70px 1fr 160px 70px;padding-left:18px;padding-right:18px;}
-      .modal-title-custom{font-size:28px;}
+      .page{padding:120px 16px 30px;}
+    }
+
+    /* ✅ mobile: font kecil + tabel geser kanan */
+    @media (max-width: 576px){
+      body{font-size:13px;}
+      .title{font-size:32px;}
+      .subtitle{font-size:12px;}
+      .btn-add{font-size:12px;padding:10px 18px;margin-top:10px;}
+      .table-head{font-size:16px;padding:14px 16px;}
+      .table-row{font-size:14px;padding:14px 16px;}
+      .icon-btn{width:40px;height:40px;}
+      .icon-edit,.icon-trash{font-size:20px;}
+      .modal-header-custom{padding:18px 18px 14px;}
+      .modal-title-custom{font-size:22px;}
+      .modal-subtitle-custom{font-size:12px;}
+      .modal-body{padding:14px 14px 16px;}
+      .label-plain{font-size:13px;}
+      .input-pill{font-size:13px;padding:9px 14px;}
+      .btn-save{font-size:12px;padding:10px 18px;border-radius:12px;}
+      .dropzone{height:140px;}
+      .dropzone .dz-icon{font-size:40px;}
+      .dropzone .dz-text{font-size:12px;}
+
+      .table-grid{min-width:760px;}
     }
   </style>
 </head>
@@ -604,7 +391,6 @@ $paket = db()->query("
   <div class="container d-flex justify-content-between align-items-center">
 
     <div class="d-flex align-items-center gap-2">
-
       <a class="btn-back" href="javascript:history.back()" aria-label="Kembali" title="Kembali">
         <i class="bi bi-arrow-left"></i>
       </a>
@@ -615,11 +401,13 @@ $paket = db()->query("
           <strong>KPU</strong><br>DIY
         </span>
       </a>
-
     </div>
 
-    <ul class="navbar-nav-simple">
-      <li><a class="nav-link" href="login_admin.php">LOGOUT</a></li>
+    <!-- ✅ LOGOUT tampil di mobile + style sama dashboard -->
+    <ul class="navbar-nav flex-row gap-5 align-items-center">
+      <li class="nav-item">
+        <a class="nav-link nav-hover" href="login_admin.php">LOGOUT</a>
+      </li>
     </ul>
 
   </div>
@@ -628,12 +416,12 @@ $paket = db()->query("
 <main class="page">
   <div class="d-flex justify-content-between align-items-start flex-wrap gap-3" style="max-width:980px;margin:0 auto;">
     <div>
-      <h1 class="title">Daftar Soal</h1>
-      <div class="subtitle">Klik tombol edit untuk memperbarui soal.</div>
+      <h1 class="title">Daftar Materi</h1>
+      <div class="subtitle">Klik tombol edit untuk memperbarui file atau judul materi.</div>
     </div>
 
     <button class="btn-add" type="button" id="btnOpenAdd">
-      <span>+ Tambah Soal</span>
+      <span>+ Tambah Materi</span>
     </button>
   </div>
 
@@ -645,370 +433,338 @@ $paket = db()->query("
   <?php endif; ?>
 
   <section class="table-wrap">
-    <div class="table-head">
-      <div></div>
-      <div class="text">PAKET SOAL</div>
-      <div class="text-center">JUMLAH SOAL</div>
-      <div></div>
-    </div>
-
-    <?php foreach ($paket as $p): ?>
-      <div class="table-row">
-        <div class="cell-center">
-          <button class="icon-btn btn-edit" type="button"
-                  data-id="<?= (int)$p["id"] ?>"
-                  data-judul="<?= htmlspecialchars($p["judul"]) ?>"
-                  data-mode="<?= htmlspecialchars((string)$p["input_mode"]) ?>">
-            <i class="bi bi-pencil-fill icon-edit"></i>
-          </button>
-        </div>
-
-        <div>
-          <?= htmlspecialchars($p["judul"]) ?>
-          <span class="mode-badge"><?= strtoupper((string)$p["input_mode"]) ?></span>
-        </div>
-
-        <div class="cell-center"><?= (int)$p["jumlah_soal"] ?></div>
-
-        <div class="cell-center">
-          <form method="post" onsubmit="return confirm('Yakin hapus paket kuis ini?')">
-            <input type="hidden" name="action" value="paket_delete">
-            <input type="hidden" name="paket_id" value="<?= (int)$p["id"] ?>">
-            <button class="icon-btn" type="submit" title="Hapus">
-              <i class="bi bi-trash3-fill icon-trash"></i>
-            </button>
-          </form>
-        </div>
+    <!-- ✅ wrapper scroll -->
+    <div class="table-scroll">
+      <div class="table-head table-grid">
+        <div></div>
+        <div class="text">JUDUL MATERI</div>
+        <div class="text-center">JUMLAH SLIDE</div>
+        <div></div>
       </div>
-    <?php endforeach; ?>
 
-    <div style="height:14px;background:#fff"></div>
+      <?php foreach ($rows as $r): ?>
+        <?php
+          $rid = (int)$r["id"];
+          $media = $mediaByMateri[$rid] ?? [];
+          $pdfFile = $media[0] ?? "";
+        ?>
+        <div class="table-row table-grid">
+          <div class="cell-center">
+            <button class="icon-btn btn-edit"
+                    type="button"
+                    data-id="<?= $rid ?>"
+                    data-judul="<?= htmlspecialchars($r["judul"]) ?>"
+                    data-pdf="<?= htmlspecialchars($pdfFile) ?>">
+              <i class="bi bi-pencil-fill icon-edit"></i>
+            </button>
+          </div>
+
+          <div><?= htmlspecialchars($r["judul"]) ?></div>
+          <div class="cell-center"><?= (int)$r["jumlah_slide"] ?></div>
+
+          <div class="cell-center">
+            <form method="post" onsubmit="return confirm('Yakin hapus materi ini?')">
+              <input type="hidden" name="action" value="delete">
+              <input type="hidden" name="id" value="<?= $rid ?>">
+              <button class="icon-btn" type="submit" title="Hapus">
+                <i class="bi bi-trash3-fill icon-trash"></i>
+              </button>
+            </form>
+          </div>
+        </div>
+      <?php endforeach; ?>
+
+      <div style="height:14px;background:#fff"></div>
+    </div>
   </section>
+  
 </main>
 
-<div class="modal fade" id="kuisModal" tabindex="-1" aria-hidden="true">
-  <div class="modal-dialog modal-dialog-centered modal-lg">
-    <form class="modal-content" id="kuisForm" method="post" enctype="multipart/form-data">
+<!-- MODAL -->
+<div class="modal fade" id="materiModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <form class="modal-content" id="materiForm" method="post" enctype="multipart/form-data">
       <div class="modal-header-custom">
         <button type="button" class="modal-close-x" data-bs-dismiss="modal" aria-label="Close">&times;</button>
-        <div class="modal-title-custom" id="modalTitle">Input Kuis</div>
-        <div class="modal-subtitle-custom">Lengkapi formulir di bawah ini</div>
+        <div class="modal-title-custom" id="modalTitle">Materi Baru</div>
+        <div class="modal-subtitle-custom">Upload materi hanya dalam bentuk PDF</div>
       </div>
 
       <div class="modal-body">
-        <input type="hidden" name="action" id="actionInput" value="csv_import">
-        <input type="hidden" name="paket_id" id="paketIdInput" value="">
-        <input type="hidden" name="bulk_json" id="bulkJsonInput" value="">
+        <input type="hidden" name="action" id="actionInput" value="add">
+        <input type="hidden" name="id" id="idInput" value="">
+        <input type="hidden" name="mode" id="modeInput" value="pdf">
 
-        <div class="d-flex justify-content-between align-items-center gap-3 flex-wrap">
-          <div class="flex-grow-1">
-            <label class="fw-bold mb-2" style="font-size:14px;">Judul Kuis</label>
-            <input class="pill-input" type="text" name="judul_paket" id="judulPaketInput" placeholder="Tuliskan Judul Kuis di sini..." required>
+        <div class="label-plain">Judul Materi</div>
+        <input class="input-pill" name="judul" id="judulInput" type="text" placeholder="Tuliskan judul materi di sini..." required>
+
+        <div class="mt-3" style="font-weight:800;font-size:14px;">Input Materi</div>
+        <div style="font-style:italic;font-size:12px;">(PDF) max. 500Kb</div>
+
+        <input id="pdfPicker" name="pdf" type="file" accept="application/pdf" class="d-none">
+
+        <div class="pdf-preview-box" id="pdfPreviewBox" style="display:none;">
+          <div class="pdf-meta">
+            <div id="pdfName" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px;"></div>
+            <button type="button" class="btn btn-sm btn-light" id="btnChangePdf" style="border-radius:999px;font-weight:900;">
+              Ganti PDF
+            </button>
           </div>
 
-          <div class="mode-switch mt-2 mt-md-4" id="modeSwitch">
-            <div class="mode-pill active" data-mode="csv">CSV</div>
-            <div class="mode-pill inactive" data-mode="manual">Manual</div>
+          <div class="pdf-canvas-wrap" id="canvasWrap">
+            <canvas id="pdfCanvas"></canvas>
+          </div>
+
+          <iframe id="pdfFallback" class="pdf-fallback" title="Preview PDF"></iframe>
+        </div>
+
+        <div class="dropzone" id="dropzone">
+          <div>
+            <div class="dz-icon"><i class="bi bi-file-earmark-pdf"></i></div>
+            <div class="dz-text">Klik atau seret file PDF ke sini</div>
           </div>
         </div>
 
-        <div id="csvArea" class="mt-4">
-          <div class="d-flex justify-content-between align-items-center">
-            <label class="fw-bold mb-2" style="font-size:14px;">Input Kuis</label>
-            <a class="tpl-link" href="kuis_admin.php?download=template_csv" target="_blank" rel="noopener">
-              <i class="bi bi-download"></i> Unduh Template CSV
-            </a>
-          </div>
-
-          <div class="info-max">
-            <i class="bi bi-exclamation-circle"></i> Maksimal 15 soal (nomor 1–15)
-          </div>
-
-          <input type="file" name="csv" id="csvInput" accept=".csv,text/csv" class="d-none">
-          <div class="dropzone" id="csvDrop">
-            <div>
-              <div class="dz-icon"><i class="bi bi-filetype-csv"></i></div>
-              <div class="dz-text">Klik atau seret file CSV ke sini</div>
-              <div class="dz-text" id="csvName" style="font-size:12px;opacity:.85;"></div>
-            </div>
-          </div>
-          <div class="text-muted mt-2" style="font-size:12px;">
-            Kolom wajib: <b>nomor, pertanyaan, opsi_a, opsi_b, opsi_c, opsi_d, jawaban(A/B/C/D)</b>
-          </div>
-        </div>
-
-        <!-- MANUAL AREA -->
-        <div id="manualArea" class="mt-4" style="display:none;">
-          <label class="fw-bold mb-2" style="font-size:14px;">Input Kuis</label>
-
-          <div class="info-max">
-            <i class="bi bi-exclamation-circle"></i> Maksimal 15 soal (nomor 1–15)
-          </div>
-
-          <div class="numbers" id="numbers"></div>
-          <input type="hidden" id="nomorActive" value="1">
-
-          <div class="mt-3">
-            <label class="fw-bold mb-2" style="font-size:14px;">Pertanyaan</label>
-            <textarea class="big" id="pertanyaanInput" placeholder="Tuliskan Pertanyaan di sini..."></textarea>
-          </div>
-
-          <div class="row g-3 mt-1">
-            <div class="col-md-6">
-              <label class="fw-bold mb-2" style="font-size:14px;">Pilihan A</label>
-              <input class="pill-input" id="opsiA" placeholder="Jawaban A...">
-            </div>
-            <div class="col-md-6">
-              <label class="fw-bold mb-2" style="font-size:14px;">Pilihan B</label>
-              <input class="pill-input" id="opsiB" placeholder="Jawaban B...">
-            </div>
-            <div class="col-md-6">
-              <label class="fw-bold mb-2" style="font-size:14px;">Pilihan C</label>
-              <input class="pill-input" id="opsiC" placeholder="Jawaban C...">
-            </div>
-            <div class="col-md-6">
-              <label class="fw-bold mb-2" style="font-size:14px;">Pilihan D</label>
-              <input class="pill-input" id="opsiD" placeholder="Jawaban D...">
-            </div>
-          </div>
-
-          <div class="mt-3">
-            <label class="fw-bold mb-2" style="font-size:14px;">Kunci Jawaban Benar</label>
-            <div class="ans-grid" id="ansGrid">
-              <label class="ans-item" data-val="A"><input type="radio" name="jawaban_radio" value="A"> <span>A</span></label>
-              <label class="ans-item" data-val="B"><input type="radio" name="jawaban_radio" value="B"> <span>B</span></label>
-              <label class="ans-item" data-val="C"><input type="radio" name="jawaban_radio" value="C"> <span>C</span></label>
-              <label class="ans-item" data-val="D"><input type="radio" name="jawaban_radio" value="D"> <span>D</span></label>
-            </div>
-          </div>
-        </div>
-
-        <div class="actions">
-          <button class="btn-outline" type="button" data-bs-dismiss="modal">Batalkan</button>
-          <button class="btn-save" type="submit">Simpan</button>
+        <div class="actions-row">
+          <button class="btn-save" type="submit" id="btnSave">Simpan</button>
         </div>
       </div>
     </form>
   </div>
 </div>
 
+<!-- penting: bootstrap bundle dulu -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<!-- pdfjs optional (kalau gagal load, modal tetap jalan) -->
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.js"></script>
 
 <script>
-  const modalEl = document.getElementById("kuisModal");
-  const modal = new bootstrap.Modal(modalEl, { backdrop: true, keyboard: true });
+(function(){
+  const UPLOAD_URL = <?= json_encode($UPLOAD_URL) ?>;
 
-  const btnOpenAdd = document.getElementById("btnOpenAdd");
-  const modalTitle = document.getElementById("modalTitle");
+  // ===== ambil elemen =====
+  const materiModalEl = document.getElementById('materiModal');
+  const btnOpenAdd = document.getElementById('btnOpenAdd');
+  const modalTitle = document.getElementById('modalTitle');
+  const actionInput = document.getElementById('actionInput');
+  const idInput = document.getElementById('idInput');
+  const judulInput = document.getElementById('judulInput');
 
-  const actionInput = document.getElementById("actionInput");
-  const paketIdInput = document.getElementById("paketIdInput");
-  const judulPaketInput = document.getElementById("judulPaketInput");
-  const bulkJsonInput = document.getElementById("bulkJsonInput");
+  const pdfPicker = document.getElementById('pdfPicker');
+  const dropzone = document.getElementById('dropzone');
 
-  const modeSwitch = document.getElementById("modeSwitch");
-  const csvArea = document.getElementById("csvArea");
-  const manualArea = document.getElementById("manualArea");
+  const pdfPreviewBox = document.getElementById('pdfPreviewBox');
+  const pdfName = document.getElementById('pdfName');
+  const btnChangePdf = document.getElementById('btnChangePdf');
+  const pdfCanvas = document.getElementById('pdfCanvas');
+  const canvasWrap = document.getElementById('canvasWrap');
+  const pdfFallback = document.getElementById('pdfFallback');
 
-  const csvInput = document.getElementById("csvInput");
-  const csvDrop = document.getElementById("csvDrop");
-  const csvName = document.getElementById("csvName");
+  const materiForm = document.getElementById('materiForm');
 
-  const numbers = document.getElementById("numbers");
-  const nomorActive = document.getElementById("nomorActive");
+  // ===== bootstrap modal =====
+  const materiModal = new bootstrap.Modal(materiModalEl, { backdrop: true, keyboard: true });
 
-  const pertanyaanInput = document.getElementById("pertanyaanInput");
-  const opsiA = document.getElementById("opsiA");
-  const opsiB = document.getElementById("opsiB");
-  const opsiC = document.getElementById("opsiC");
-  const opsiD = document.getElementById("opsiD");
+  let currentAction = "add";
+  let pickedPdfFile = null;
+  let existingPdfFilename = "";
 
-  const ansGrid = document.getElementById("ansGrid");
-
-  let currentMode = "csv";
-  let cacheSoal = {};
-
-  function setMode(mode){
-    currentMode = mode;
-
-    modeSwitch.querySelectorAll(".mode-pill").forEach(p=>{
-      const on = p.dataset.mode === mode;
-      p.classList.toggle("active", on);
-      p.classList.toggle("inactive", !on);
-    });
-    csvArea.style.display = (mode === "csv") ? "block" : "none";
-    manualArea.style.display = (mode === "manual") ? "block" : "none";
+  function setFileToInput(file){
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    pdfPicker.files = dt.files;
   }
 
-  modeSwitch.addEventListener("click", (e)=>{
-    const pill = e.target.closest(".mode-pill");
-    if(!pill) return;
-    setMode(pill.dataset.mode);
-  });
-
-  function clearJawabanRadio(){
-    ansGrid.querySelectorAll("input[type=radio]").forEach(r => r.checked = false);
-    ansGrid.querySelectorAll(".ans-item").forEach(x => x.classList.remove("active"));
+  function validatePdfFile(file){
+    if(!file) return "File tidak ditemukan.";
+    if(file.type !== "application/pdf") return "Tipe file harus PDF.";
+    if(file.size > 500 * 1024) return "Ukuran file terlalu besar (maks 500KB).";
+    return "";
   }
 
-  function setJawabanRadio(val){
-    clearJawabanRadio();
-    const r = ansGrid.querySelector(`input[type=radio][value="${val}"]`);
-    if(r) r.checked = true;
-    const lab = ansGrid.querySelector(`.ans-item[data-val="${val}"]`);
-    if(lab) lab.classList.add("active");
+  function showPreviewBox(name){
+    pdfPreviewBox.style.display = "block";
+    pdfName.textContent = name || "";
   }
 
-  ansGrid.addEventListener("click", (e)=>{
-    const lab = e.target.closest(".ans-item");
-    if(!lab) return;
-    setJawabanRadio(lab.dataset.val);
-  });
-
-  function getJawabanVal(){
-    const r = ansGrid.querySelector("input[type=radio]:checked");
-    return r ? r.value : "";
+  function clearCanvas(){
+    const ctx = pdfCanvas.getContext("2d");
+    ctx.clearRect(0, 0, pdfCanvas.width, pdfCanvas.height);
   }
 
-  function saveDraft(){
-    const no = parseInt(nomorActive.value,10);
-    cacheSoal[no] = {
-      pertanyaan: pertanyaanInput.value || "",
-      a: opsiA.value || "",
-      b: opsiB.value || "",
-      c: opsiC.value || "",
-      d: opsiD.value || "",
-      jawaban: getJawabanVal() || ""
-    };
+  function hidePreviewBox(){
+    pdfPreviewBox.style.display = "none";
+    pdfName.textContent = "";
+    pickedPdfFile = null;
+    existingPdfFilename = "";
+    clearCanvas();
+    pdfFallback.style.display = "none";
+    pdfFallback.src = "";
+    canvasWrap.style.display = "block";
   }
 
-  function loadDraft(no){
-    const d = cacheSoal[no] || {pertanyaan:"",a:"",b:"",c:"",d:"",jawaban:""};
-    pertanyaanInput.value = d.pertanyaan;
-    opsiA.value = d.a; opsiB.value = d.b; opsiC.value = d.c; opsiD.value = d.d;
-    if(d.jawaban) setJawabanRadio(d.jawaban); else clearJawabanRadio();
-  }
+  async function renderCoverWithPdfJsFromArrayBuffer(buf){
+    if(typeof window.pdfjsLib === "undefined") return false;
 
-  function buildNumbers(){
-    numbers.innerHTML = "";
-    const activeNo = parseInt(nomorActive.value,10);
-    for(let i=1;i<=15;i++){
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "num-btn";
-      btn.textContent = i;
+    try{
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.js";
 
-      if(i === activeNo) btn.classList.add("active");
-      if(cacheSoal[i] && (cacheSoal[i].pertanyaan || "").trim() !== "") btn.classList.add("filled");
+      const pdf = await window.pdfjsLib.getDocument({data: buf}).promise;
+      const page = await pdf.getPage(1);
 
-      btn.addEventListener("click", ()=>{
-        saveDraft();
-        nomorActive.value = String(i);
-        loadDraft(i);
-        buildNumbers();
-      });
+      const baseViewport = page.getViewport({ scale: 1 });
+      const targetWidth = Math.min(640, pdfPreviewBox.clientWidth - 28);
+      const scale = targetWidth / baseViewport.width;
+      const viewport = page.getViewport({ scale });
 
-      numbers.appendChild(btn);
+      const ctx = pdfCanvas.getContext("2d");
+      pdfCanvas.width = Math.floor(viewport.width);
+      pdfCanvas.height = Math.floor(viewport.height);
+
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      return true;
+    }catch(e){
+      return false;
     }
   }
 
-  function resetForm(){
-    paketIdInput.value = "";
-    judulPaketInput.value = "";
-    bulkJsonInput.value = "";
-    cacheSoal = {};
-    nomorActive.value = "1";
+  async function renderCoverWithPdfJsFromUrl(url){
+    if(typeof window.pdfjsLib === "undefined") return false;
 
-    pertanyaanInput.value = "";
-    opsiA.value=""; opsiB.value=""; opsiC.value=""; opsiD.value="";
-    clearJawabanRadio();
+    try{
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.js";
 
-    csvInput.value = "";
-    csvName.textContent = "";
+      const pdf = await window.pdfjsLib.getDocument(url).promise;
+      const page = await pdf.getPage(1);
 
-    buildNumbers();
-    setMode("csv");
+      const baseViewport = page.getViewport({ scale: 1 });
+      const targetWidth = Math.min(640, pdfPreviewBox.clientWidth - 28);
+      const scale = targetWidth / baseViewport.width;
+      const viewport = page.getViewport({ scale });
+
+      const ctx = pdfCanvas.getContext("2d");
+      pdfCanvas.width = Math.floor(viewport.width);
+      pdfCanvas.height = Math.floor(viewport.height);
+
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      return true;
+    }catch(e){
+      return false;
+    }
   }
 
-  // CSV dropzone
-  csvDrop.addEventListener("click", ()=> csvInput.click());
-  csvDrop.addEventListener("dragover", (e)=>{ e.preventDefault(); csvDrop.classList.add("dragover"); });
-  csvDrop.addEventListener("dragleave", ()=> csvDrop.classList.remove("dragover"));
-  csvDrop.addEventListener("drop", (e)=>{
-    e.preventDefault();
-    csvDrop.classList.remove("dragover");
-    if(e.dataTransfer.files && e.dataTransfer.files[0]){
-      csvInput.files = e.dataTransfer.files;
-      csvName.textContent = e.dataTransfer.files[0].name;
+  function renderFallbackIframe(url){
+    canvasWrap.style.display = "none";
+    pdfFallback.style.display = "block";
+    pdfFallback.src = url + "#page=1&zoom=page-width";
+  }
+
+  async function handlePdfSelect(file){
+    const msg = validatePdfFile(file);
+    if(msg){ alert(msg); return; }
+
+    pickedPdfFile = file;
+    setFileToInput(file);
+
+    showPreviewBox(file.name);
+
+    const buf = await file.arrayBuffer();
+    const ok = await renderCoverWithPdfJsFromArrayBuffer(buf);
+    if(!ok){
+      const blobUrl = URL.createObjectURL(file);
+      renderFallbackIframe(blobUrl);
+    }else{
+      pdfFallback.style.display = "none";
+      pdfFallback.src = "";
+      canvasWrap.style.display = "block";
     }
+  }
+
+  function resetModal(){
+    judulInput.value = "";
+    actionInput.value = "add";
+    idInput.value = "";
+    pdfPicker.value = "";
+    hidePreviewBox();
+  }
+
+  btnOpenAdd.addEventListener('click', () => {
+    currentAction = "add";
+    modalTitle.textContent = "Materi Baru";
+    resetModal();
+    materiModal.show();
   });
-  csvInput.addEventListener("change", ()=>{
-    if(csvInput.files && csvInput.files[0]) csvName.textContent = csvInput.files[0].name;
-  });
 
-  // Tambah
-  btnOpenAdd.addEventListener("click", ()=>{
-    resetForm();
-    modalTitle.textContent = "Input Kuis";
-    modal.show();
-  });
+  document.querySelectorAll('.btn-edit').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      currentAction = "edit";
+      modalTitle.textContent = "Edit Materi";
 
-  // Edit => selalu load soal dari DB, dan user boleh edit manual walau awalnya CSV
-  document.querySelectorAll(".btn-edit").forEach(btn=>{
-    btn.addEventListener("click", async ()=>{
-      resetForm();
-      modalTitle.textContent = "Edit Kuis";
+      resetModal();
+      actionInput.value = "edit";
+      idInput.value = btn.dataset.id || "";
+      judulInput.value = btn.dataset.judul || "";
+      existingPdfFilename = btn.dataset.pdf || "";
 
-      paketIdInput.value = btn.dataset.id || "";
-      judulPaketInput.value = btn.dataset.judul || "";
+      if(existingPdfFilename){
+        showPreviewBox(existingPdfFilename);
+        const url = `${UPLOAD_URL}/${existingPdfFilename}`;
 
-      try{
-        const res = await fetch(`kuis_admin.php?ajax=paket_detail&id=${encodeURIComponent(paketIdInput.value)}`, { cache: "no-store" });
-        const json = await res.json();
-
-        if(json.ok){
-          cacheSoal = {};
-          (json.soal || []).forEach(s=>{
-            const no = parseInt(s.nomor,10);
-            cacheSoal[no] = {
-              pertanyaan: s.pertanyaan || "",
-              a: s.opsi_a || "",
-              b: s.opsi_b || "",
-              c: s.opsi_c || "",
-              d: s.opsi_d || "",
-              jawaban: s.jawaban || ""
-            };
-          });
-          nomorActive.value = "1";
-          loadDraft(1);
-          buildNumbers();
-
-          // ✅ otomatis tampil manual agar bisa edit meskipun paket awalnya CSV
-          setMode("manual");
+        const ok = await renderCoverWithPdfJsFromUrl(url);
+        if(!ok){
+          renderFallbackIframe(url);
+        }else{
+          pdfFallback.style.display = "none";
+          pdfFallback.src = "";
+          canvasWrap.style.display = "block";
         }
-      }catch(e){
-        // kalau gagal load, tetap tampil modal
       }
 
-      modal.show();
+      materiModal.show();
     });
   });
 
-  // submit: csv => csv_import, manual => soal_save_bulk
-  document.getElementById("kuisForm").addEventListener("submit", ()=>{
-    if(currentMode === "csv"){
-      actionInput.value = "csv_import";
-      return;
-    }
-    saveDraft();
-    actionInput.value = "soal_save_bulk";
-    bulkJsonInput.value = JSON.stringify(cacheSoal);
+  pdfPicker.addEventListener('change', () => {
+    const f = (pdfPicker.files || [])[0];
+    if(f) handlePdfSelect(f);
   });
 
-  resetForm();
+  btnChangePdf.addEventListener('click', () => pdfPicker.click());
+
+  dropzone.addEventListener('click', () => pdfPicker.click());
+  dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+  dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+  dropzone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropzone.classList.remove('dragover');
+    const f = (e.dataTransfer.files || [])[0];
+    if(f) handlePdfSelect(f);
+  });
+
+  materiForm.addEventListener("submit", (e) => {
+    const hasPdf = (pdfPicker.files && pdfPicker.files.length > 0);
+
+    if(currentAction === "add" && !hasPdf){
+      e.preventDefault();
+      alert("Wajib upload file PDF.");
+      return;
+    }
+
+    if(hasPdf){
+      const msg = validatePdfFile(pdfPicker.files[0]);
+      if(msg){
+        e.preventDefault();
+        alert(msg);
+        return;
+      }
+    }
+  });
+
+})();
 </script>
 
 <?php include 'footer.php'; ?>
-
 </body>
 </html>
