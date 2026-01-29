@@ -7,9 +7,6 @@ if (empty($_SESSION["admin"])) {
   exit;
 }
 
-/* =======================
-   KONFIG DATABASE & UPLOAD
-======================= */
 $DB_HOST = "localhost";
 $DB_NAME = "sinau_pemilu";
 $DB_USER = "root";
@@ -20,9 +17,6 @@ $UPLOAD_URL = "uploads/materi";
 
 if (!is_dir($UPLOAD_DIR)) { @mkdir($UPLOAD_DIR, 0775, true); }
 
-/* =======================
-   DB CONNECT
-======================= */
 function db(): PDO {
   global $DB_HOST, $DB_NAME, $DB_USER, $DB_PASS;
   static $pdo = null;
@@ -36,9 +30,6 @@ function db(): PDO {
   return $pdo;
 }
 
-/* =======================
-   HELPERS
-======================= */
 function safe_name(string $ext): string {
   $ext = strtolower($ext);
   return "materi_" . date("Ymd_His") . "_" . bin2hex(random_bytes(6)) . "." . $ext;
@@ -57,24 +48,19 @@ function count_pdf_pages(string $pdfPath): int {
   return 1;
 }
 
-function upload_one(array $file, array $allowExt, int $maxBytes, string $destDir): array {
+function upload_one_pdf(array $file, int $maxBytes, string $destDir): array {
   if (!isset($file["tmp_name"]) || !is_uploaded_file($file["tmp_name"])) return [false,"","File wajib diupload."];
   if (($file["error"] ?? UPLOAD_ERR_OK) !== UPLOAD_ERR_OK) return [false,"","Upload gagal."];
-  if (($file["size"] ?? 0) > $maxBytes) return [false,"","Ukuran file terlalu besar."];
+  if (($file["size"] ?? 0) > $maxBytes) return [false,"","Ukuran file terlalu besar (maks 500KB)."];
 
   $ext = strtolower(pathinfo((string)($file["name"] ?? ""), PATHINFO_EXTENSION));
-  if (!in_array($ext, $allowExt, true)) return [false,"","Tipe file tidak sesuai."];
+  if ($ext !== "pdf") return [false,"","Tipe file tidak sesuai (wajib PDF)."];
 
   $finfo = new finfo(FILEINFO_MIME_TYPE);
   $mime = $finfo->file($file["tmp_name"]);
+  if (!in_array($mime, ["application/pdf","application/x-pdf"], true)) return [false,"","File tidak valid (bukan PDF)."];
 
-  $okMime = false;
-  if ($ext === "pdf" && in_array($mime, ["application/pdf","application/x-pdf"], true)) $okMime = true;
-  if (in_array($ext, ["jpg","jpeg"], true) && in_array($mime, ["image/jpeg"], true)) $okMime = true;
-  if ($ext === "png" && in_array($mime, ["image/png"], true)) $okMime = true;
-  if (!$okMime) return [false,"","File tidak valid."];
-
-  $name = safe_name($ext === "jpeg" ? "jpg" : $ext);
+  $name = safe_name("pdf");
   $path = rtrim($destDir,"/") . "/" . $name;
 
   if (!move_uploaded_file($file["tmp_name"], $path)) return [false,"","Gagal menyimpan file."];
@@ -92,28 +78,27 @@ function remove_media_files(int $materiId): void {
   db()->prepare("DELETE FROM materi_media WHERE materi_id=?")->execute([$materiId]);
 }
 
-/* =======================
-   CRUD HANDLER
-======================= */
 $toast = ["type"=>"", "msg"=>""];
+$lastAction = "";
 
 try {
   if ($_SERVER["REQUEST_METHOD"] === "POST") {
     $action = (string)($_POST["action"] ?? "");
+    $lastAction = $action;
 
     if ($action === "add" || $action === "edit") {
       $judul = trim((string)($_POST["judul"] ?? ""));
-      $mode  = (string)($_POST["mode"] ?? "jpg");
+      $mode  = (string)($_POST["mode"] ?? "pdf");
+
       if ($judul === "") throw new RuntimeException("Judul wajib diisi.");
-      if (!in_array($mode, ["pdf","jpg"], true)) throw new RuntimeException("Mode tidak valid.");
+      if ($mode !== "pdf") throw new RuntimeException("Materi hanya boleh dalam bentuk PDF.");
 
       db()->beginTransaction();
 
       if ($action === "add") {
-        db()->prepare("INSERT INTO materi (judul, tipe, jumlah_slide) VALUES (?, ?, 0)")
-          ->execute([$judul, $mode]);
+        db()->prepare("INSERT INTO materi (judul, tipe, jumlah_slide) VALUES (?, 'pdf', 0)")
+          ->execute([$judul]);
         $materiId = (int)db()->lastInsertId();
-        $oldMode = null;
       } else {
         $materiId = (int)($_POST["id"] ?? 0);
         if ($materiId <= 0) throw new RuntimeException("ID tidak valid.");
@@ -122,83 +107,36 @@ try {
         $st->execute([$materiId]);
         $row = $st->fetch();
         if (!$row) throw new RuntimeException("Materi tidak ditemukan.");
-        $oldMode = (string)$row["tipe"];
+        if ((string)$row["tipe"] !== "pdf") throw new RuntimeException("Tipe materi tidak valid di database.");
 
-        db()->prepare("UPDATE materi SET judul=?, tipe=? WHERE id=?")
-          ->execute([$judul, $mode, $materiId]);
+        db()->prepare("UPDATE materi SET judul=? WHERE id=?")
+          ->execute([$judul, $materiId]);
       }
 
-      // Deteksi apakah user benar-benar upload file baru
       $hasNewPdf = isset($_FILES["pdf"]) && ($_FILES["pdf"]["error"] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK;
-      $hasNewJpg = isset($_FILES["jpgs"]) && is_array($_FILES["jpgs"]["name"] ?? null) && !empty($_FILES["jpgs"]["name"][0]);
-
-      // Kalau edit dan cuma ubah judul (tanpa upload baru) -> jangan sentuh media
-      $shouldReplaceMedia = ($action === "add") || ($oldMode !== $mode) || ($mode === "pdf" && $hasNewPdf) || ($mode === "jpg" && $hasNewJpg);
+      $shouldReplaceMedia = ($action === "add") || $hasNewPdf;
 
       if ($shouldReplaceMedia) {
-        // hapus media lama hanya jika memang ada upload/berubah mode
+        if (!$hasNewPdf) throw new RuntimeException("Silakan pilih file PDF.");
+
         remove_media_files($materiId);
 
-        // MODE PDF
-        if ($mode === "pdf") {
-          if (!$hasNewPdf && $action !== "add") {
-            // edit mode pdf tapi tidak upload pdf baru -> harusnya tidak sampai sini
-            // karena $shouldReplaceMedia false, tapi sebagai safety:
-            throw new RuntimeException("Silakan pilih file PDF.");
-          }
+        [$ok,$fn,$err] = upload_one_pdf($_FILES["pdf"] ?? [], 500*1024, $UPLOAD_DIR);
+        if (!$ok) throw new RuntimeException($err);
 
-          [$ok,$fn,$err] = upload_one($_FILES["pdf"] ?? [], ["pdf"], 500*1024, $UPLOAD_DIR);
-          if (!$ok) throw new RuntimeException($err);
+        $pages = count_pdf_pages($UPLOAD_DIR . "/" . $fn);
 
-          $pages = count_pdf_pages($UPLOAD_DIR . "/" . $fn);
+        db()->prepare("INSERT INTO materi_media (materi_id, file_path, sort_order) VALUES (?, ?, 0)")
+          ->execute([$materiId, $fn]);
 
-          db()->prepare("INSERT INTO materi_media (materi_id, file_path, sort_order) VALUES (?, ?, 0)")
-            ->execute([$materiId, $fn]);
-
-          db()->prepare("UPDATE materi SET jumlah_slide=? WHERE id=?")
-            ->execute([$pages, $materiId]);
-        }
-
-        // MODE JPG
-        if ($mode === "jpg") {
-          if (!$hasNewJpg && $action !== "add") {
-            // edit mode jpg tapi tidak upload jpg baru -> harusnya tidak sampai sini
-            throw new RuntimeException("Silakan pilih minimal 1 gambar.");
-          }
-
-          $count = is_array($_FILES["jpgs"]["name"] ?? null) ? count($_FILES["jpgs"]["name"]) : 0;
-          if ($count === 0) throw new RuntimeException("Minimal 1 gambar.");
-
-          $max = min(10, $count);
-          $saved = 0;
-
-          for ($i=0; $i<$max; $i++) {
-            $file = [
-              "name" => $_FILES["jpgs"]["name"][$i] ?? "",
-              "type" => $_FILES["jpgs"]["type"][$i] ?? "",
-              "tmp_name" => $_FILES["jpgs"]["tmp_name"][$i] ?? "",
-              "error" => $_FILES["jpgs"]["error"][$i] ?? UPLOAD_ERR_NO_FILE,
-              "size" => $_FILES["jpgs"]["size"][$i] ?? 0
-            ];
-
-            [$ok,$fn,$err] = upload_one($file, ["jpg","jpeg","png"], 100*1024, $UPLOAD_DIR);
-            if (!$ok) continue;
-
-            db()->prepare("INSERT INTO materi_media (materi_id, file_path, sort_order) VALUES (?, ?, ?)")
-              ->execute([$materiId, $fn, $saved]);
-
-            $saved++;
-          }
-
-          if ($saved === 0) throw new RuntimeException("Tidak ada gambar yang berhasil diupload.");
-
-          db()->prepare("UPDATE materi SET jumlah_slide=? WHERE id=?")
-            ->execute([$saved, $materiId]);
-        }
+        db()->prepare("UPDATE materi SET jumlah_slide=? WHERE id=?")
+          ->execute([$pages, $materiId]);
       }
 
       db()->commit();
-      $toast = ["type"=>"success","msg"=> $action==="add" ? "Materi berhasil ditambahkan." : "Materi berhasil diperbarui."];
+
+      if ($action === "add") $toast = ["type"=>"success","msg"=>"Berhasil menambahkan " . $judul];
+      else $toast = ["type"=>"success","msg"=>"Berhasil memperbarui " . $judul];
     }
 
     if ($action === "delete") {
@@ -213,12 +151,12 @@ try {
   }
 } catch (Throwable $e) {
   if (db()->inTransaction()) db()->rollBack();
-  $toast = ["type"=>"danger","msg"=>$e->getMessage()];
+
+  $reason = $e->getMessage();
+  if ($lastAction === "edit") $toast = ["type"=>"danger","msg"=>"Gagal memperbarui materi karena " . $reason];
+  else $toast = ["type"=>"danger","msg"=>"Gagal menambahkan materi karena " . $reason];
 }
 
-/* =======================
-   LOAD DATA
-======================= */
 $rows = db()->query("SELECT * FROM materi ORDER BY id DESC")->fetchAll();
 
 $mediaByMateri = [];
@@ -245,91 +183,193 @@ foreach ($st->fetchAll() as $m) {
 
   <style>
     :root{
-      --maroon:#700D09; --bg:#e9edff;
-      --table-shadow:0 18px 26px rgba(0,0,0,.18);
-      --header-gray:#d9d9d9; --row-line:#e6e6e6; --modal-radius:28px;
+      --maroon:#700D09;
+      --bg:#E9EDFF;
+      --header-gray:#d9d9d9;
+      --row-line:#e6e6e6;
+      --shadow:0 14px 22px rgba(0,0,0,.18);
     }
-    body{margin:0;font-family:'Inter',system-ui,-apple-system,sans-serif;background:var(--bg);min-height:100vh;}
+
+    body{
+      margin:0;
+      font-family:'Inter';
+      background:var(--bg);
+      min-height:100vh;
+      display:flex;
+      flex-direction:column;
+    }
+
     .bg-maroon{background:var(--maroon)!important}
-    .navbar-nav-simple{list-style:none;display:flex;align-items:center;gap:34px;margin:0;padding:0;}
-    .navbar-nav-simple .nav-link{color:#fff;font-weight:700;letter-spacing:.5px;text-decoration:none;padding:6px 0;}
-    .navbar-nav-simple .nav-link.active{position:relative;}
-    .navbar-nav-simple .nav-link.active::after{content:"";position:absolute;left:0;right:0;margin:auto;bottom:-10px;width:64px;height:3px;background:#fff;border-radius:2px;opacity:.95;}
-    .page{max-width:1200px;margin:0 auto;padding:120px 20px 40px;}
-    .btn-back{border:0;background:var(--maroon);color:#fff;font-weight:800;font-size:18px;padding:12px 34px;border-radius:999px;cursor:pointer;box-shadow:0 10px 14px rgba(0,0,0,.18);display:inline-flex;align-items:center;gap:14px;margin-top:16px;}
-    .title{font-weight:800;font-size:54px;margin:0;color:#111;line-height:1.05;}
-    .subtitle{margin-top:10px;color:#333;font-size:18px;font-style:italic;}
-    .btn-add{border:0;background:var(--maroon);color:#fff;font-weight:800;font-size:26px;padding:14px 54px;border-radius:999px;box-shadow:0 12px 16px rgba(0,0,0,.18);display:inline-flex;align-items:center;gap:14px;white-space:nowrap;}
-    .table-wrap{margin-top:34px;background:#fff;border-radius:26px;overflow:hidden;box-shadow:var(--table-shadow);}
-    .table-head{background:var(--header-gray);padding:24px 34px;display:grid;grid-template-columns:110px 1fr 240px 110px;align-items:center;font-weight:800;font-size:22px;color:#111;}
-    .table-row{padding:22px 34px;display:grid;grid-template-columns:110px 1fr 240px 110px;align-items:center;border-top:1px solid var(--row-line);font-size:20px;}
+    .navbar{padding:20px 0;border-bottom:1px solid rgba(0,0,0,.15);}
+    .navbar-nav-simple{list-style:none;display:flex;align-items:center;gap:46px;margin:0;padding:0;}
+    .navbar-nav-simple .nav-link{color:#fff;font-weight:800;letter-spacing:.5px;text-decoration:none;position:relative;padding:6px 0 12px;}
+    .navbar-nav-simple .nav-link::after{
+      content:"";position:absolute;left:0;right:0;margin:auto;bottom:0;
+      width:0;height:3px;background:#fff;border-radius:2px;transition:.25s ease;opacity:.95;
+    }
+    .navbar-nav-simple .nav-link:hover::after{width:70px;}
+    .navbar-nav-simple .nav-link.active::after{width:70px;}
+
+    .page{
+      max-width:1200px;
+      margin:0 auto;
+      width:100%;
+      padding:140px 20px 40px;
+      flex:1;
+    }
+
+    .title{font-weight:900;font-size:48px;margin:0;color:#111;line-height:1.05;}
+    .subtitle{margin-top:10px;color:#333;font-size:14px;font-style:italic;}
+
+    .btn-add{
+      border:0;background:var(--maroon);color:#fff;
+      font-weight:600;font-size:14px;
+      padding:12px 34px;border-radius:999px;
+      display:inline-flex;align-items:center;gap:10px;white-space:nowrap;
+      box-shadow:0 10px 18px rgba(0,0,0,.18);
+      transition:transform .2s ease, filter .2s ease;
+      margin-top:18px;
+    }
+    .btn-add:hover{filter:brightness(.92);transform:translateY(1px);}
+    .btn-add:active{transform:translateY(2px);}
+
+    .table-wrap{
+      margin-top:44px;background:#fff;border-radius:26px;overflow:hidden;
+      box-shadow:var(--shadow);max-width:980px;margin-left:auto;margin-right:auto;
+    }
+    .table-head{
+      background:var(--header-gray);padding:18px 34px;
+      display:grid;grid-template-columns:90px 1fr 220px 90px;align-items:center;
+      font-weight:900;font-size:20px;color:#111;
+    }
+    .table-row{
+      padding:18px 34px;display:grid;grid-template-columns:90px 1fr 220px 90px;
+      align-items:center;border-top:1px solid var(--row-line);font-size:16px;color:#111;
+    }
     .cell-center{text-align:center;}
-    .icon-btn{border:0;background:transparent;padding:0;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;border-radius:12px;transition:background .15s;}
-    .icon-btn:hover{background:rgba(112,13,9,.08);}
-    .icon-edit,.icon-trash{color:var(--maroon);font-size:26px;}
-    .footer-img{width:100%;height:110px;object-fit:cover;display:block;margin-top:auto;}
 
-    .modal-dialog{max-width:980px}
-    .modal-content{border:0;border-radius:var(--modal-radius);overflow:hidden;box-shadow:0 30px 60px rgba(0,0,0,.28);}
-    .modal-header-custom{background:var(--maroon);padding:34px 38px 28px;position:relative;}
-    .modal-title-custom{margin:0;color:#fff;font-weight:800;font-size:44px;line-height:1.05;}
-    .modal-subtitle-custom{margin-top:6px;color:rgba(255,255,255,.85);font-style:italic;font-size:18px;}
-    .modal-close-x{position:absolute;top:28px;right:28px;width:48px;height:48px;border-radius:12px;border:0;background:transparent;color:#fff;font-size:34px;display:flex;align-items:center;justify-content:center;}
-    .modal-body{padding:28px 38px 34px}
-    .label-plain{font-weight:500;font-size:20px;color:#111;margin-bottom:10px;}
-    .input-pill{border:2px solid #111;border-radius:999px;padding:12px 18px;font-size:18px;outline:none;width:min(520px,100%);}
+    .icon-btn{
+      border:0;background:transparent;padding:0;cursor:pointer;
+      display:inline-flex;align-items:center;justify-content:center;
+      width:44px;height:44px;border-radius:12px;
+      transition:background .15s ease, transform .15s ease;
+    }
+    .icon-btn:hover{background:rgba(112,13,9,.08);transform:translateY(-1px);}
+    .icon-edit,.icon-trash{color:var(--maroon);font-size:22px;}
 
-    .mode-switch{width:210px;background:#d9d9d9;border-radius:999px;padding:6px;display:flex;gap:6px;position:relative;user-select:none;}
-    .mode-pill{flex:1;border-radius:999px;padding:10px 0;text-align:center;font-weight:800;cursor:pointer;color:#fff;position:relative;z-index:2;font-size:18px;letter-spacing:.4px;opacity:.9;}
-    .mode-pill.inactive{opacity:.55}
-    .mode-slider{position:absolute;top:6px;bottom:6px;width:calc(50% - 6px);left:6px;border-radius:999px;background:var(--maroon);transition:transform .22s ease;z-index:1;}
-    .mode-switch[data-mode="jpg"] .mode-slider{transform:translateX(100%)}
+    /* ===== MODAL (tidak merusak bootstrap) ===== */
+    .label-plain{font-weight:600;font-size:14px;color:#111;margin-bottom:8px;}
+    .input-pill{
+      border:2px solid #111;border-radius:999px;
+      padding:10px 18px;font-size:13px;outline:none;width:min(520px,100%);
+    }
 
-    .media-grid{margin-top:14px;display:grid;grid-template-columns:repeat(4, 1fr);gap:16px;max-width:720px;}
-    .slot{border-radius:18px;background:#d9d9d9;height:86px;display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden;cursor:pointer;}
-    .slot .plus{font-size:42px;color:#fff;font-weight:300;line-height:1;opacity:.95;}
-    .thumb{position:absolute;inset:0;background-size:cover;background-position:center;}
-    .thumb-overlay{position:absolute;inset:0;background:rgba(0,0,0,.35);}
-    .thumb-close{position:absolute;top:8px;right:8px;width:24px;height:24px;border-radius:999px;border:0;background:rgba(0,0,0,.55);color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;cursor:pointer;z-index:3;}
+    .modal-dialog{ max-width:680px; }
+    .modal-content{
+      border:0;border-radius:28px;overflow:hidden;
+      box-shadow:0 30px 60px rgba(0,0,0,.30);
+    }
+    .modal-header-custom{
+      background:var(--maroon);
+      padding:22px 28px 16px;
+      position:relative;
+    }
+    .modal-title-custom{margin:0;color:#fff;font-weight:800;font-size:28px;line-height:1.05;}
+    .modal-subtitle-custom{margin-top:6px;color:rgba(255,255,255,.85);font-style:italic;font-size:13px;}
+    .modal-close-x{
+      position:absolute;top:16px;right:18px;width:44px;height:44px;border-radius:12px;
+      border:0;background:transparent;color:#fff;font-size:30px;display:flex;
+      align-items:center;justify-content:center;opacity:.95;
+    }
 
-    .dropzone{margin-top:16px;max-width:740px;height:220px;border-radius:20px;background:#d9d9d9;border:2px dashed rgba(112,13,9,.25);display:flex;align-items:center;justify-content:center;text-align:center;gap:14px;cursor:pointer;}
+    .modal-body{
+      padding:22px 28px 26px;
+      background:#fff;
+      max-height:70vh;
+      overflow:auto;
+    }
+
+    .pdf-preview-box{
+      margin-top:12px;background:#d9d9d9;border-radius:18px;padding:14px;
+    }
+    .pdf-meta{
+      display:flex;align-items:center;justify-content:space-between;gap:10px;
+      margin-bottom:10px;color:#111;font-size:12px;font-weight:800;
+    }
+    .pdf-canvas-wrap{
+      background:#fff;border-radius:14px;overflow:hidden;
+      box-shadow:0 10px 18px rgba(0,0,0,.10);
+    }
+    #pdfCanvas{display:block;width:100%;height:auto;}
+    .pdf-fallback{
+      width:100%;
+      height:360px;
+      border:0;
+      display:none;
+      background:#fff;
+    }
+
+    .dropzone{
+      margin-top:12px;height:150px;border-radius:18px;background:#d9d9d9;border:2px dashed rgba(112,13,9,.25);
+      display:flex;align-items:center;justify-content:center;text-align:center;cursor:pointer;
+    }
     .dropzone.dragover{outline:3px solid rgba(112,13,9,.35);}
-    .dropzone .dz-icon{font-size:56px;color:#fff;}
-    .dropzone .dz-text{color:#fff;font-size:18px;font-weight:600;}
+    .dropzone .dz-icon{font-size:42px;color:#fff;}
+    .dropzone .dz-text{color:#fff;font-size:13px;font-weight:800;}
 
-    .pdf-preview{margin-top:16px;max-width:740px;height:140px;border-radius:22px;overflow:hidden;background:#3a0b0a;position:relative;display:none;}
-    .pdf-preview .pv-overlay{position:absolute;inset:0;background:rgba(112,13,9,.72);}
-    .pdf-preview .pv-title{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:30px;text-align:center;padding:0 22px;line-height:1.1;}
+    .actions-row{display:flex;justify-content:flex-end;margin-top:16px;gap:10px;}
+    .btn-save{
+      border:0;background:var(--maroon);color:#fff;font-weight:800;font-size:14px;
+      padding:12px 44px;border-radius:14px;
+    }
 
-    .actions-row{display:flex;justify-content:flex-end;margin-top:26px;gap:12px;}
-    .btn-save{border:0;background:var(--maroon);color:#fff;font-weight:700;font-size:20px;padding:16px 64px;border-radius:18px;box-shadow:0 14px 18px rgba(0,0,0,.18);}
+    .btn-back{
+      width:42px;height:42px;border-radius:12px;
+      display:inline-flex;align-items:center;justify-content:center;
+      color:#fff;
+      text-decoration:none;
+      transition:transform .15s ease, filter .15s ease;
+    }
+    .btn-back:hover{filter:brightness(1.05);transform:translateY(-1px);}
+    .btn-back i{font-size:22px;line-height:1;}
+
+    @media (max-width: 992px){
+      .navbar-nav-simple{display:none;}
+      .title{font-size:40px;}
+      .table-wrap{max-width:100%;}
+      .table-head,.table-row{grid-template-columns:70px 1fr 160px 70px;padding-left:18px;padding-right:18px;}
+    }
   </style>
 </head>
 <body>
 
-<nav class="navbar navbar-dark bg-maroon fixed-top" style="padding:20px 0;">
+<nav class="navbar navbar-dark bg-maroon fixed-top">
   <div class="container d-flex justify-content-between align-items-center">
-    <a class="navbar-brand d-flex align-items-center gap-2" href="admin.php">
-      <img src="Asset/LogoKPU.png" width="40" height="40" alt="KPU Logo">
-      <span><span class="fw-bold">KPU</span><br><span class="fw-normal">DIY</span></span>
-    </a>
+
+    <div class="d-flex align-items-center gap-2">
+
+      <a class="btn-back" href="javascript:history.back()" aria-label="Kembali" title="Kembali">
+        <i class="bi bi-arrow-left"></i>
+      </a>
+
+      <a class="navbar-brand d-flex align-items-center gap-2" href="admin.php">
+        <img src="Asset/LogoKPU.png" width="40" height="40" alt="KPU">
+        <span class="lh-sm text-white fs-6">
+          <strong>KPU</strong><br>DIY
+        </span>
+      </a>
+
+    </div>
 
     <ul class="navbar-nav-simple">
-      <li><a class="nav-link" href="dashboard.php">HOME</a></li>
-      <li><a class="nav-link active" href="tambah_materi_admin.php">MATERI</a></li>
-      <li><a class="nav-link" href="kuis_Admin.php">KUIS</a></li>
-      <li><a class="nav-link" href="kontak.php">KONTAK</a></li>
-      <li><a class="nav-link" href="dashboard.php">LOGOUT</a></li>
+      <li><a class="nav-link" href="login_admin.php">LOGOUT</a></li>
     </ul>
+
   </div>
 </nav>
 
 <main class="page">
-  <button class="btn-back" type="button" onclick="history.back()">
-    <i class="bi bi-arrow-left"></i> Kembali
-  </button>
-
-  <div class="d-flex justify-content-between align-items-start flex-wrap gap-3 mt-5">
+  <div class="d-flex justify-content-between align-items-start flex-wrap gap-3" style="max-width:980px;margin:0 auto;">
     <div>
       <h1 class="title">Daftar Materi</h1>
       <div class="subtitle">Klik tombol edit untuk memperbarui file atau judul materi.</div>
@@ -341,7 +381,8 @@ foreach ($st->fetchAll() as $m) {
   </div>
 
   <?php if ($toast["type"]): ?>
-    <div class="alert alert-<?= htmlspecialchars($toast["type"]) ?> mt-4" style="border-radius:16px;font-weight:700;">
+    <div class="alert alert-<?= htmlspecialchars($toast["type"]) ?> mt-4"
+         style="border-radius:16px;font-weight:800;max-width:980px;margin-left:auto;margin-right:auto;">
       <?= htmlspecialchars($toast["msg"]) ?>
     </div>
   <?php endif; ?>
@@ -349,21 +390,24 @@ foreach ($st->fetchAll() as $m) {
   <section class="table-wrap">
     <div class="table-head">
       <div></div>
-      <div class="text-center">JUDUL MATERI</div>
+      <div class="text">JUDUL MATERI</div>
       <div class="text-center">JUMLAH SLIDE</div>
       <div></div>
     </div>
 
     <?php foreach ($rows as $r): ?>
-      <?php $rid = (int)$r["id"]; $media = $mediaByMateri[$rid] ?? []; ?>
+      <?php
+        $rid = (int)$r["id"];
+        $media = $mediaByMateri[$rid] ?? [];
+        $pdfFile = $media[0] ?? "";
+      ?>
       <div class="table-row">
         <div class="cell-center">
           <button class="icon-btn btn-edit"
                   type="button"
                   data-id="<?= $rid ?>"
                   data-judul="<?= htmlspecialchars($r["judul"]) ?>"
-                  data-tipe="<?= htmlspecialchars($r["tipe"]) ?>"
-                  data-media='<?= htmlspecialchars(json_encode($media, JSON_UNESCAPED_SLASHES)) ?>'>
+                  data-pdf="<?= htmlspecialchars($pdfFile) ?>">
             <i class="bi bi-pencil-fill icon-edit"></i>
           </button>
         </div>
@@ -383,11 +427,9 @@ foreach ($st->fetchAll() as $m) {
       </div>
     <?php endforeach; ?>
 
-    <div style="height:18px;background:#fff"></div>
+    <div style="height:14px;background:#fff"></div>
   </section>
 </main>
-
-<img src="Asset/Footer.png" class="footer-img" alt="Footer">
 
 <!-- MODAL -->
 <div class="modal fade" id="materiModal" tabindex="-1" aria-hidden="true">
@@ -396,50 +438,41 @@ foreach ($st->fetchAll() as $m) {
       <div class="modal-header-custom">
         <button type="button" class="modal-close-x" data-bs-dismiss="modal" aria-label="Close">&times;</button>
         <div class="modal-title-custom" id="modalTitle">Materi Baru</div>
-        <div class="modal-subtitle-custom">Lengkapi formulir di bawah ini</div>
+        <div class="modal-subtitle-custom">Upload materi hanya dalam bentuk PDF</div>
       </div>
 
       <div class="modal-body">
         <input type="hidden" name="action" id="actionInput" value="add">
         <input type="hidden" name="id" id="idInput" value="">
-        <input type="hidden" name="mode" id="modeInput" value="jpg">
+        <input type="hidden" name="mode" id="modeInput" value="pdf">
 
         <div class="label-plain">Judul Materi</div>
         <input class="input-pill" name="judul" id="judulInput" type="text" placeholder="Tuliskan judul materi di sini..." required>
 
-        <div class="d-flex justify-content-between align-items-end flex-wrap gap-3 mt-4">
-          <div>
-            <div class="section-title" id="sectionLabel">Input Materi</div>
-            <div class="hint-red" id="hintLabel">(JPG/PNG) max. 100Kb (max 10)</div>
-          </div>
+        <div class="mt-3" style="font-weight:800;font-size:14px;">Input Materi</div>
+        <div style="font-style:italic;font-size:12px;">(PDF) max. 500Kb</div>
 
-          <div class="mode-switch" id="modeSwitch" data-mode="jpg">
-            <div class="mode-slider"></div>
-            <div class="mode-pill" id="pillPdf">PDF</div>
-            <div class="mode-pill" id="pillJpg">JPG</div>
-          </div>
-        </div>
-
-        <!-- IMPORTANT: input file JANGAN dihapus value-nya sebelum submit, karena kita isi lewat DataTransfer -->
-        <input id="jpgPicker" name="jpgs[]" type="file" accept="image/png,image/jpeg" multiple class="d-none">
         <input id="pdfPicker" name="pdf" type="file" accept="application/pdf" class="d-none">
 
-        <div id="jpgArea">
-          <div class="media-grid" id="mediaGrid"></div>
-        </div>
-
-        <div id="pdfArea" style="display:none;">
-          <div class="pdf-preview" id="pdfPreview">
-            <div class="pv-overlay"></div>
-            <div class="pv-title" id="pdfPreviewTitle">PDF TERPILIH</div>
+        <div class="pdf-preview-box" id="pdfPreviewBox" style="display:none;">
+          <div class="pdf-meta">
+            <div id="pdfName" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px;"></div>
+            <button type="button" class="btn btn-sm btn-light" id="btnChangePdf" style="border-radius:999px;font-weight:900;">
+              Ganti PDF
+            </button>
           </div>
 
-          <div class="dropzone" id="dropzone">
-            <div>
-              <div class="dz-icon"><i class="bi bi-file-earmark-pdf"></i></div>
-              <div class="dz-text">Klik atau seret file PDF ke sini</div>
-              <div class="dz-text" style="font-size:14px; font-weight:600; opacity:.85" id="pdfName"></div>
-            </div>
+          <div class="pdf-canvas-wrap" id="canvasWrap">
+            <canvas id="pdfCanvas"></canvas>
+          </div>
+
+          <iframe id="pdfFallback" class="pdf-fallback" title="Preview PDF"></iframe>
+        </div>
+
+        <div class="dropzone" id="dropzone">
+          <div>
+            <div class="dz-icon"><i class="bi bi-file-earmark-pdf"></i></div>
+            <div class="dz-text">Klik atau seret file PDF ke sini</div>
           </div>
         </div>
 
@@ -451,178 +484,213 @@ foreach ($st->fetchAll() as $m) {
   </div>
 </div>
 
+<!-- penting: bootstrap bundle dulu -->
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<!-- pdfjs optional (kalau gagal load, modal tetap jalan) -->
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.js"></script>
 
 <script>
+(function(){
   const UPLOAD_URL = <?= json_encode($UPLOAD_URL) ?>;
 
+  // ===== ambil elemen =====
   const materiModalEl = document.getElementById('materiModal');
-  const materiModal = new bootstrap.Modal(materiModalEl, { backdrop: true, keyboard: true });
-
-  const materiForm = document.getElementById('materiForm');
+  const btnOpenAdd = document.getElementById('btnOpenAdd');
   const modalTitle = document.getElementById('modalTitle');
-  const sectionLabel = document.getElementById('sectionLabel');
-  const hintLabel = document.getElementById('hintLabel');
-  const judulInput = document.getElementById('judulInput');
-
   const actionInput = document.getElementById('actionInput');
   const idInput = document.getElementById('idInput');
-  const modeInput = document.getElementById('modeInput');
+  const judulInput = document.getElementById('judulInput');
 
-  const modeSwitch = document.getElementById('modeSwitch');
-  const pillPdf = document.getElementById('pillPdf');
-  const pillJpg = document.getElementById('pillJpg');
-
-  const jpgArea = document.getElementById('jpgArea');
-  const pdfArea = document.getElementById('pdfArea');
-
-  const jpgPicker = document.getElementById('jpgPicker');
   const pdfPicker = document.getElementById('pdfPicker');
-
-  const mediaGrid = document.getElementById('mediaGrid');
   const dropzone = document.getElementById('dropzone');
-  const pdfPreview = document.getElementById('pdfPreview');
-  const pdfName = document.getElementById('pdfName');
-  const pdfPreviewTitle = document.getElementById('pdfPreviewTitle');
 
-  const MAX_SLOTS = 10;
+  const pdfPreviewBox = document.getElementById('pdfPreviewBox');
+  const pdfName = document.getElementById('pdfName');
+  const btnChangePdf = document.getElementById('btnChangePdf');
+  const pdfCanvas = document.getElementById('pdfCanvas');
+  const canvasWrap = document.getElementById('canvasWrap');
+  const pdfFallback = document.getElementById('pdfFallback');
+
+  const materiForm = document.getElementById('materiForm');
+
+  // ===== bootstrap modal =====
+  const materiModal = new bootstrap.Modal(materiModalEl, { backdrop: true, keyboard: true });
 
   let currentAction = "add";
-  let existingMedia = [];      // nama file lama (dari server) -> hanya preview
-  let pickedJpgFiles = [];     // File object baru
-  let pickedPdfFile = null;    // File object baru
+  let pickedPdfFile = null;
+  let existingPdfFilename = "";
 
-  function setMode(mode){
-    modeSwitch.setAttribute('data-mode', mode);
-    modeInput.value = mode;
+  function setFileToInput(file){
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    pdfPicker.files = dt.files;
+  }
 
-    if(mode === "pdf"){
-      pillPdf.classList.remove('inactive');
-      pillJpg.classList.add('inactive');
-      jpgArea.style.display = "none";
-      pdfArea.style.display = "block";
-      hintLabel.textContent = "(PDF) max. 500Kb";
-    }else{
-      pillJpg.classList.remove('inactive');
-      pillPdf.classList.add('inactive');
-      jpgArea.style.display = "block";
-      pdfArea.style.display = "none";
-      hintLabel.textContent = "(JPG/PNG) max. 100Kb (max 10)";
+  function validatePdfFile(file){
+    if(!file) return "File tidak ditemukan.";
+    if(file.type !== "application/pdf") return "Tipe file harus PDF.";
+    if(file.size > 500 * 1024) return "Ukuran file terlalu besar (maks 500KB).";
+    return "";
+  }
+
+  function showPreviewBox(name){
+    pdfPreviewBox.style.display = "block";
+    pdfName.textContent = name || "";
+  }
+
+  function clearCanvas(){
+    const ctx = pdfCanvas.getContext("2d");
+    ctx.clearRect(0, 0, pdfCanvas.width, pdfCanvas.height);
+  }
+
+  function hidePreviewBox(){
+    pdfPreviewBox.style.display = "none";
+    pdfName.textContent = "";
+    pickedPdfFile = null;
+    existingPdfFilename = "";
+    clearCanvas();
+    pdfFallback.style.display = "none";
+    pdfFallback.src = "";
+    canvasWrap.style.display = "block";
+  }
+
+  async function renderCoverWithPdfJsFromArrayBuffer(buf){
+    if(typeof window.pdfjsLib === "undefined") return false;
+
+    try{
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.js";
+
+      const pdf = await window.pdfjsLib.getDocument({data: buf}).promise;
+      const page = await pdf.getPage(1);
+
+      const baseViewport = page.getViewport({ scale: 1 });
+      const targetWidth = Math.min(640, pdfPreviewBox.clientWidth - 28);
+      const scale = targetWidth / baseViewport.width;
+      const viewport = page.getViewport({ scale });
+
+      const ctx = pdfCanvas.getContext("2d");
+      pdfCanvas.width = Math.floor(viewport.width);
+      pdfCanvas.height = Math.floor(viewport.height);
+
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      return true;
+    }catch(e){
+      return false;
     }
-    sectionLabel.textContent = currentAction === "edit" ? "Edit Materi" : "Input Materi";
+  }
+
+  async function renderCoverWithPdfJsFromUrl(url){
+    if(typeof window.pdfjsLib === "undefined") return false;
+
+    try{
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.js";
+
+      const pdf = await window.pdfjsLib.getDocument(url).promise;
+      const page = await pdf.getPage(1);
+
+      const baseViewport = page.getViewport({ scale: 1 });
+      const targetWidth = Math.min(640, pdfPreviewBox.clientWidth - 28);
+      const scale = targetWidth / baseViewport.width;
+      const viewport = page.getViewport({ scale });
+
+      const ctx = pdfCanvas.getContext("2d");
+      pdfCanvas.width = Math.floor(viewport.width);
+      pdfCanvas.height = Math.floor(viewport.height);
+
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      return true;
+    }catch(e){
+      return false;
+    }
+  }
+
+  function renderFallbackIframe(url){
+    canvasWrap.style.display = "none";
+    pdfFallback.style.display = "block";
+    pdfFallback.src = url + "#page=1&zoom=page-width";
+  }
+
+  async function handlePdfSelect(file){
+    const msg = validatePdfFile(file);
+    if(msg){ alert(msg); return; }
+
+    pickedPdfFile = file;
+    setFileToInput(file);
+
+    showPreviewBox(file.name);
+
+    const buf = await file.arrayBuffer();
+    const ok = await renderCoverWithPdfJsFromArrayBuffer(buf);
+    if(!ok){
+      // fallback: pakai blob url
+      const blobUrl = URL.createObjectURL(file);
+      renderFallbackIframe(blobUrl);
+    }else{
+      pdfFallback.style.display = "none";
+      pdfFallback.src = "";
+      canvasWrap.style.display = "block";
+    }
   }
 
   function resetModal(){
     judulInput.value = "";
-    existingMedia = [];
-    pickedJpgFiles = [];
-    pickedPdfFile = null;
-
-    pdfName.textContent = "";
-    pdfPreview.style.display = "none";
-    pdfPreviewTitle.textContent = "PDF TERPILIH";
-
-    // jangan langsung kosongkan file input di sini kalau user baru pilih (tapi reset modal aman)
-    jpgPicker.value = "";
+    actionInput.value = "add";
+    idInput.value = "";
     pdfPicker.value = "";
-
-    setMode("jpg");
-    renderGrid();
+    hidePreviewBox();
   }
 
-  function renderGrid(){
-    mediaGrid.innerHTML = "";
+  // ===== tombol tambah =====
+  btnOpenAdd.addEventListener('click', () => {
+    currentAction = "add";
+    modalTitle.textContent = "Materi Baru";
+    resetModal();
+    materiModal.show();
+  });
 
-    const combined = [];
-    for(const m of existingMedia) combined.push({type:"existing", value:m});
-    for(const f of pickedJpgFiles) combined.push({type:"new", value:f});
+  // ===== tombol edit =====
+  document.querySelectorAll('.btn-edit').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      currentAction = "edit";
+      modalTitle.textContent = "Edit Materi";
 
-    const shown = combined.slice(0, MAX_SLOTS);
+      resetModal();
+      actionInput.value = "edit";
+      idInput.value = btn.dataset.id || "";
+      judulInput.value = btn.dataset.judul || "";
+      existingPdfFilename = btn.dataset.pdf || "";
 
-    for(let i=0;i<MAX_SLOTS;i++){
-      const slot = document.createElement('div');
-      slot.className = "slot";
+      if(existingPdfFilename){
+        showPreviewBox(existingPdfFilename);
+        const url = `${UPLOAD_URL}/${existingPdfFilename}`;
 
-      if(shown[i]){
-        const item = shown[i];
-        let bgUrl = "";
-
-        if(item.type === "existing"){
-          bgUrl = `${UPLOAD_URL}/${item.value}`;
+        // coba pdfjs
+        const ok = await renderCoverWithPdfJsFromUrl(url);
+        if(!ok){
+          // fallback iframe dari url server
+          renderFallbackIframe(url);
         }else{
-          bgUrl = URL.createObjectURL(item.value);
+          pdfFallback.style.display = "none";
+          pdfFallback.src = "";
+          canvasWrap.style.display = "block";
         }
-
-        const thumb = document.createElement('div');
-        thumb.className = "thumb";
-        thumb.style.backgroundImage = `url('${bgUrl}')`;
-
-        const overlay = document.createElement('div');
-        overlay.className = "thumb-overlay";
-
-        const close = document.createElement('button');
-        close.type = "button";
-        close.className = "thumb-close";
-        close.innerHTML = "&times;";
-        close.addEventListener('click', (e) => {
-          e.stopPropagation();
-          if(item.type === "existing"){
-            const idx = existingMedia.indexOf(item.value);
-            if(idx >= 0) existingMedia.splice(idx, 1);
-          }else{
-            const idx = pickedJpgFiles.indexOf(item.value);
-            if(idx >= 0) pickedJpgFiles.splice(idx, 1);
-          }
-          renderGrid();
-        });
-
-        slot.appendChild(thumb);
-        slot.appendChild(overlay);
-        slot.appendChild(close);
-      } else {
-        const plus = document.createElement('div');
-        plus.className = "plus";
-        plus.textContent = "+";
-        slot.appendChild(plus);
       }
 
-      slot.addEventListener('click', () => {
-        if(modeSwitch.getAttribute('data-mode') !== "jpg") return;
-        jpgPicker.click();
-      });
-
-      mediaGrid.appendChild(slot);
-    }
-  }
-
-  // JPG input: simpan file object ke array (JANGAN buang semua input tanpa alasan)
-  jpgPicker.addEventListener('change', () => {
-    const incoming = Array.from(jpgPicker.files || []);
-    if(incoming.length === 0) return;
-
-    for(const f of incoming){
-      if(pickedJpgFiles.length >= MAX_SLOTS) break;
-      pickedJpgFiles.push(f);
-    }
-
-    // boleh kosongkan input supaya bisa pilih file yang sama lagi
-    jpgPicker.value = "";
-    renderGrid();
+      materiModal.show();
+    });
   });
 
-  function handlePdfSelect(file){
-    if(!file) return;
-    pickedPdfFile = file;
-    pdfName.textContent = file.name;
-    pdfPreviewTitle.textContent = file.name.length > 34 ? file.name.slice(0,34) + "..." : file.name;
-    pdfPreview.style.display = "block";
-  }
-
+  // ===== pilih file =====
   pdfPicker.addEventListener('change', () => {
-    handlePdfSelect((pdfPicker.files || [])[0]);
-    pdfPicker.value = "";
+    const f = (pdfPicker.files || [])[0];
+    if(f) handlePdfSelect(f);
   });
 
+  btnChangePdf.addEventListener('click', () => pdfPicker.click());
+
+  // ===== dropzone =====
   dropzone.addEventListener('click', () => pdfPicker.click());
   dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
   dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
@@ -633,85 +701,29 @@ foreach ($st->fetchAll() as $m) {
     if(f) handlePdfSelect(f);
   });
 
-  pillPdf.addEventListener('click', () => setMode("pdf"));
-  pillJpg.addEventListener('click', () => setMode("jpg"));
-
-  document.getElementById('btnOpenAdd').addEventListener('click', () => {
-    currentAction = "add";
-    modalTitle.textContent = "Materi Baru";
-    actionInput.value = "add";
-    idInput.value = "";
-    resetModal();
-    materiModal.show();
-  });
-
-  document.querySelectorAll('.btn-edit').forEach(btn => {
-    btn.addEventListener('click', () => {
-      currentAction = "edit";
-      modalTitle.textContent = "Edit Materi";
-      actionInput.value = "edit";
-
-      resetModal();
-
-      idInput.value = btn.dataset.id || "";
-      judulInput.value = btn.dataset.judul || "";
-
-      const tipe = btn.dataset.tipe || "jpg";
-      let media = [];
-      try{ media = JSON.parse(btn.dataset.media || "[]"); }catch(e){ media = []; }
-
-      if(tipe === "pdf"){
-        setMode("pdf");
-        if(media[0]){
-          pdfPreviewTitle.textContent = media[0];
-          pdfPreview.style.display = "block";
-          pdfName.textContent = media[0];
-        }
-      } else {
-        setMode("jpg");
-        existingMedia = media;
-        renderGrid();
-      }
-
-      materiModal.show();
-    });
-  });
-
-  // ✅ KUNCI PERBAIKAN: sebelum submit, isi file input pakai DataTransfer
+  // ===== submit =====
   materiForm.addEventListener("submit", (e) => {
-    const mode = modeInput.value;
+    const hasPdf = (pdfPicker.files && pdfPicker.files.length > 0);
 
-    if (mode === "jpg") {
-      if (pickedJpgFiles.length === 0 && currentAction === "add") {
-        e.preventDefault();
-        alert("Pilih minimal 1 gambar.");
-        return;
-      }
-
-      const dt = new DataTransfer();
-      pickedJpgFiles.slice(0, MAX_SLOTS).forEach(f => dt.items.add(f));
-      jpgPicker.files = dt.files; // sekarang $_FILES['jpgs'] terisi
+    if(currentAction === "add" && !hasPdf){
+      e.preventDefault();
+      alert("Wajib upload file PDF.");
+      return;
     }
 
-    if (mode === "pdf") {
-      if (!pickedPdfFile && currentAction === "add") {
+    if(hasPdf){
+      const msg = validatePdfFile(pdfPicker.files[0]);
+      if(msg){
         e.preventDefault();
-        alert("Pilih file PDF.");
+        alert(msg);
         return;
-      }
-
-      if (pickedPdfFile) {
-        const dt = new DataTransfer();
-        dt.items.add(pickedPdfFile);
-        pdfPicker.files = dt.files; // sekarang $_FILES['pdf'] terisi
       }
     }
   });
 
-  // init
-  setMode("jpg");
-  renderGrid();
+})();
 </script>
 
+<?php include 'footer.php'; ?>
 </body>
 </html>
