@@ -54,6 +54,7 @@ try {
     AFTER judul
   ");
 } catch (Throwable $e) {
+  // kolom sudah ada -> abaikan
 }
 
 function safe_name(string $ext): string {
@@ -120,7 +121,6 @@ try {
       if ($judul === "") throw new RuntimeException("Judul wajib diisi.");
       if ($mode !== "pdf") throw new RuntimeException("Materi hanya boleh dalam bentuk PDF.");
 
-      // validasi bagian
       if ($bagian === "" || !in_array($bagian, $BAGIAN_OPTIONS, true)) {
         $bagian = $DEFAULT_BAGIAN;
       }
@@ -283,9 +283,7 @@ foreach ($st->fetchAll() as $m) {
       -webkit-overflow-scrolling:touch;
     }
 
-    .table-grid{
-      min-width:980px;
-    }
+    .table-grid{min-width:980px;}
 
     .table-head{
       background:var(--header-gray);
@@ -422,7 +420,6 @@ foreach ($st->fetchAll() as $m) {
       .dropzone{height:140px;}
       .dropzone .dz-icon{font-size:40px;}
       .dropzone .dz-text{font-size:12px;}
-
       .table-grid{min-width:980px;}
     }
   </style>
@@ -431,7 +428,6 @@ foreach ($st->fetchAll() as $m) {
 
 <nav class="navbar navbar-dark bg-maroon fixed-top">
   <div class="container d-flex justify-content-between align-items-center">
-
     <div class="d-flex align-items-center gap-2">
       <a class="btn-back" href="javascript:history.back()" aria-label="Kembali" title="Kembali">
         <i class="bi bi-arrow-left"></i>
@@ -450,7 +446,6 @@ foreach ($st->fetchAll() as $m) {
         <a class="nav-link nav-hover" href="login_admin.php">LOGOUT</a>
       </li>
     </ul>
-
   </div>
 </nav>
 
@@ -521,7 +516,6 @@ foreach ($st->fetchAll() as $m) {
       <div style="height:14px;background:#fff"></div>
     </div>
   </section>
-
 </main>
 
 <!-- MODAL -->
@@ -631,6 +625,14 @@ foreach ($st->fetchAll() as $m) {
     return "";
   }
 
+  function setDropzoneVisibility() {
+    if (currentAction === "edit") {
+      dropzone.style.display = "none";
+    } else {
+      dropzone.style.display = "flex";
+    }
+  }
+
   function showPreviewBox(name){
     pdfPreviewBox.style.display = "block";
     pdfName.textContent = name || "";
@@ -714,7 +716,6 @@ foreach ($st->fetchAll() as $m) {
     if(msg){ alert(msg); return; }
 
     setFileToInput(file);
-
     showPreviewBox(file.name);
 
     const buf = await file.arrayBuffer();
@@ -731,11 +732,12 @@ foreach ($st->fetchAll() as $m) {
 
   function resetModal(){
     judulInput.value = "";
-    bagianInput.selectedIndex = 0; 
+    bagianInput.selectedIndex = 0;
     actionInput.value = "add";
     idInput.value = "";
     pdfPicker.value = "";
     hidePreviewBox();
+    setDropzoneVisibility();
   }
 
   btnOpenAdd.addEventListener('click', () => {
@@ -750,12 +752,15 @@ foreach ($st->fetchAll() as $m) {
       currentAction = "edit";
       modalTitle.textContent = "Edit Materi";
 
-      resetModal();
+      resetModal();                 // reset dulu
       actionInput.value = "edit";
       idInput.value = btn.dataset.id || "";
       judulInput.value = btn.dataset.judul || "";
+
       const bagian = btn.dataset.bagian || "";
       if (bagian) bagianInput.value = bagian;
+      
+      setDropzoneVisibility();
 
       existingPdfFilename = btn.dataset.pdf || "";
       if(existingPdfFilename){
@@ -770,6 +775,9 @@ foreach ($st->fetchAll() as $m) {
           pdfFallback.src = "";
           canvasWrap.style.display = "block";
         }
+      } else {
+        // kalau ternyata materi belum punya pdf (kasus jarang), dropzone boleh tampil biar bisa upload
+        dropzone.style.display = "flex";
       }
 
       materiModal.show();
@@ -781,12 +789,24 @@ foreach ($st->fetchAll() as $m) {
     if(f) handlePdfSelect(f);
   });
 
+  // ✅ tombol ganti pdf tetap bisa dipakai, tanpa perlu dropzone muncul
   btnChangePdf.addEventListener('click', () => pdfPicker.click());
 
-  dropzone.addEventListener('click', () => pdfPicker.click());
-  dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
-  dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+  // ✅ dropzone hanya aktif saat ADD (karena saat EDIT dropzone disembunyikan)
+  dropzone.addEventListener('click', () => {
+    if (currentAction !== "edit") pdfPicker.click();
+  });
+  dropzone.addEventListener('dragover', (e) => {
+    if (currentAction === "edit") return;
+    e.preventDefault();
+    dropzone.classList.add('dragover');
+  });
+  dropzone.addEventListener('dragleave', () => {
+    if (currentAction === "edit") return;
+    dropzone.classList.remove('dragover');
+  });
   dropzone.addEventListener('drop', (e) => {
+    if (currentAction === "edit") return;
     e.preventDefault();
     dropzone.classList.remove('dragover');
     const f = (e.dataTransfer.files || [])[0];
@@ -817,6 +837,9 @@ foreach ($st->fetchAll() as $m) {
       return;
     }
   });
+
+  // init
+  setDropzoneVisibility();
 
 })();
 </script>
