@@ -454,39 +454,12 @@ $paket = db()->query("
     .bg-maroon{background:var(--maroon)!important}
     .navbar{padding:20px 0;border-bottom:1px solid rgba(0,0,0,.15);}
 
-    .nav-link{
-      color:#fff !important;
-      font-weight:500;
-    }
+    .nav-link{color:#fff !important;font-weight:500;}
+    .nav-hover{position:relative;padding-bottom:6px;}
+    .nav-hover::after{content:"";position:absolute;left:0;bottom:0;width:0;height:3px;background:#f4c430;transition:0.3s ease;}
+    .nav-hover:hover::after,.nav-active::after{width:100%;}
 
-    .nav-hover{
-      position:relative;
-      padding-bottom:6px;
-    }
-
-    .nav-hover::after{
-      content:"";
-      position:absolute;
-      left:0;
-      bottom:0;
-      width:0;
-      height:3px;
-      background:#f4c430;
-      transition:0.3s ease;
-    }
-
-    .nav-hover:hover::after,
-    .nav-active::after{
-      width:100%;
-    }
-
-    .page{
-      max-width:1200px;
-      margin:0 auto;
-      width:100%;
-      padding:140px 20px 40px;
-      flex:1;
-    }
+    .page{max-width:1200px;margin:0 auto;width:100%;padding:140px 20px 40px;flex:1;}
 
     .title{font-weight:900;font-size:48px;margin:0;color:#111;line-height:1.05;}
     .subtitle{margin-top:10px;color:#333;font-size:14px;font-style:italic;}
@@ -507,15 +480,8 @@ $paket = db()->query("
       margin-top:44px;background:#fff;border-radius:26px;overflow:hidden;
       box-shadow:var(--shadow);max-width:980px;margin-left:auto;margin-right:auto;
     }
-
-    .table-scroll{
-      overflow-x:auto;
-      -webkit-overflow-scrolling:touch;
-    }
-
-    .table-grid{
-      min-width:980px;
-    }
+    .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+    .table-grid{min-width:980px;}
 
     .table-head{
       background:var(--header-gray);padding:18px 34px;
@@ -531,7 +497,6 @@ $paket = db()->query("
     }
 
     .cell-center{text-align:center;}
-
     .icon-btn{
       border:0;background:transparent;padding:0;cursor:pointer;
       display:inline-flex;align-items:center;justify-content:center;
@@ -560,19 +525,10 @@ $paket = db()->query("
     }
 
     .pill-input{border:2px solid #111;border-radius:999px;padding:10px 16px;font-size:14px;outline:none;width:100%;}
+    .pill-select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background-color:#fff;padding-right:42px;line-height:1.2;}
     .pill-select{
-      appearance: none;
-      -webkit-appearance: none;
-      -moz-appearance: none;
-      background-color:#fff;
-      padding-right:42px;
-      line-height: 1.2;
-    }
-
-    .pill-select{
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' fill='none' viewBox='0 0 24 24'%3E%3Cpath stroke='%23111' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-      background-repeat:no-repeat;
-      background-position:right 14px center;
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' fill='none' viewBox='0 0 24 24'%3E%3Cpath stroke='%23111' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+      background-repeat:no-repeat;background-position:right 14px center;
     }
     textarea.big{border:2px solid #111;border-radius:18px;padding:12px 14px;font-size:14px;outline:none;width:100%;min-height:130px;resize:vertical;}
 
@@ -616,24 +572,17 @@ $paket = db()->query("
     .tpl-link:hover{filter:brightness(.98);transform:translateY(-1px);}
 
     .info-max{
-      margin-top:8px;
-      font-size:12px;
-      font-weight:900;
-      color:#700D09;
+      margin-top:8px;font-size:12px;font-weight:900;color:#700D09;
       background:rgba(112,13,9,.08);
       border:1px solid rgba(112,13,9,.18);
-      padding:8px 10px;
-      border-radius:12px;
-      display:inline-flex;
-      align-items:center;
-      gap:8px;
+      padding:8px 10px;border-radius:12px;
+      display:inline-flex;align-items:center;gap:8px;
     }
 
     .btn-back{
       width:42px;height:42px;border-radius:12px;
       display:inline-flex;align-items:center;justify-content:center;
-      color:#fff;
-      text-decoration:none;
+      color:#fff;text-decoration:none;
       transition:transform .15s ease, filter .15s ease;
     }
     .btn-back:hover{filter:brightness(1.05);transform:translateY(-1px);}
@@ -666,6 +615,66 @@ $paket = db()->query("
       .info-max{font-size:11px;}
       .table-grid{min-width:980px;}
     }
+
+    .modal-overlay{
+      position:fixed;
+      inset:0;
+      background:rgba(0,0,0,.6);
+      display:none;
+      align-items:center;
+      justify-content:center;
+      z-index:9999;
+    }
+
+    .modal-content-custom{
+      background:#fff;
+      padding:26px;
+      border-radius:18px;
+      width:360px;
+      text-align:center;
+      box-shadow:0 18px 28px rgba(0,0,0,.22);
+    }
+
+    .btn-modal-action{
+      border:0;
+      border-radius:20px;
+      padding:6px 22px;
+      font-weight:600;
+      background:var(--maroon);
+      color:#fff;
+    }
+
+    .btn-modal-cancel{
+      border:2px solid #111;
+      border-radius:20px;
+      padding:6px 22px;
+      font-weight:700;
+      background:#fff;
+      color:#111;
+    }
+
+    .popup-actions{
+      display:flex;
+      gap:10px;
+      justify-content:center;
+      margin-top:14px;
+      flex-wrap:wrap;
+    }
+
+    .popup-title{
+      font-weight:900;
+      font-size:18px;
+      margin:0 0 8px;
+      color:#111;
+    }
+
+    .popup-msg{
+      margin:0;
+      font-size:14px;
+      color:#333;
+      line-height:1.45;
+      white-space:pre-line;
+    }
   </style>
 </head>
 <body>
@@ -688,7 +697,7 @@ $paket = db()->query("
 
     <ul class="navbar-nav flex-row gap-5 align-items-center">
       <li class="nav-item">
-        <a class="nav-link nav-hover" href="login_admin.php">LOGOUT</a>
+        <a class="nav-link nav-hover" href="login_admin.php" id="logoutLink">LOGOUT</a>
       </li>
     </ul>
 
@@ -707,7 +716,7 @@ $paket = db()->query("
     </button>
   </div>
 
-  <?php if ($toast["type"]): ?>
+  <?php if ($toast["type"] && $toast["type"] !== "danger"): ?>
     <div class="alert alert-<?= htmlspecialchars($toast["type"]) ?> mt-4"
          style="border-radius:16px;font-weight:800;max-width:980px;margin-left:auto;margin-right:auto;">
       <?= htmlspecialchars($toast["msg"]) ?>
@@ -752,10 +761,10 @@ $paket = db()->query("
           <div class="cell-center"><?= (int)$p["jumlah_soal"] ?></div>
 
           <div class="cell-center">
-            <form method="post" onsubmit="return confirm('Yakin hapus paket kuis ini?')">
+            <form method="post" class="form-delete-paket">
               <input type="hidden" name="action" value="paket_delete">
               <input type="hidden" name="paket_id" value="<?= (int)$p["id"] ?>">
-              <button class="icon-btn" type="submit" title="Hapus">
+              <button class="icon-btn btn-delete" type="submit" title="Hapus">
                 <i class="bi bi-trash3-fill icon-trash"></i>
               </button>
             </form>
@@ -890,6 +899,14 @@ $paket = db()->query("
   </div>
 </div>
 
+<div class="modal-overlay" id="popupOverlay" aria-hidden="true">
+  <div class="modal-content-custom" role="dialog" aria-modal="true" aria-labelledby="popupTitle" aria-describedby="popupMsg">
+    <h3 class="popup-title" id="popupTitle">Peringatan</h3>
+    <p class="popup-msg" id="popupMsg"></p>
+    <div class="popup-actions" id="popupActions"></div>
+  </div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
 <script>
@@ -924,6 +941,114 @@ $paket = db()->query("
 
   const ansGrid = document.getElementById("ansGrid");
 
+  const popupOverlay = document.getElementById("popupOverlay");
+  const popupTitle = document.getElementById("popupTitle");
+  const popupMsg = document.getElementById("popupMsg");
+  const popupActions = document.getElementById("popupActions");
+
+  function openPopup({ title="Peringatan", message="", buttons=[] }) {
+    popupTitle.textContent = title;
+    popupMsg.textContent = message;
+
+    popupActions.innerHTML = "";
+    buttons.forEach((b) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = b.variant === "cancel" ? "btn-modal-cancel" : "btn-modal-action";
+      btn.textContent = b.text || "OK";
+      btn.addEventListener("click", () => {
+        closePopup();
+        if (typeof b.onClick === "function") b.onClick();
+      });
+      popupActions.appendChild(btn);
+    });
+
+    popupOverlay.style.display = "flex";
+    popupOverlay.setAttribute("aria-hidden", "false");
+  }
+
+  function closePopup() {
+    popupOverlay.style.display = "none";
+    popupOverlay.setAttribute("aria-hidden", "true");
+  }
+
+  popupOverlay.addEventListener("click", (e) => {
+    if (e.target === popupOverlay && popupActions.children.length <= 1) closePopup();
+  });
+
+  function showError(message) {
+    openPopup({
+      title: "Terjadi Kesalahan",
+      message,
+      buttons: [{ text: "OK", variant: "primary" }]
+    });
+  }
+
+  function showConfirm({ title="Konfirmasi", message="", okText="Ya", cancelText="Batal", onOk, onCancel }) {
+    openPopup({
+      title,
+      message,
+      buttons: [
+        { text: cancelText, variant: "cancel", onClick: onCancel },
+        { text: okText, variant: "primary", onClick: onOk }
+      ]
+    });
+  }
+
+  const logoutLink = document.getElementById("logoutLink");
+  logoutLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    const href = logoutLink.getAttribute("href") || "login_admin.php";
+    showConfirm({
+      title: "Konfirmasi Logout",
+      message: "Yakin ingin logout?",
+      okText: "Logout",
+      cancelText: "Batal",
+      onOk: () => {
+        window.location.href = href;
+      }
+    });
+  });
+
+  document.querySelectorAll(".form-delete-paket").forEach((form) => {
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      showConfirm({
+        title: "Konfirmasi Hapus",
+        message: "Yakin ingin menghapus soal ini?",
+        okText: "Hapus",
+        cancelText: "Batal",
+        onOk: () => form.submit()
+      });
+    });
+  });
+
+  let isDirty = false;
+  let forceClose = false;
+  let allowSubmit = false;
+
+  function setDirty(v) { isDirty = !!v; }
+  function markDirty(){ setDirty(true); }
+  function clearDirty(){ setDirty(false); }
+
+  modalEl.addEventListener("hide.bs.modal", (e) => {
+    if (forceClose) return;
+    if (isDirty) {
+      e.preventDefault();
+      showConfirm({
+        title: "Perubahan belum disimpan",
+        message: "Perubahan belum disimpan, yakin ingin keluar?",
+        okText: "Keluar",
+        cancelText: "Tetap di sini",
+        onOk: () => {
+          forceClose = true;
+          modal.hide();
+          setTimeout(() => { forceClose = false; }, 0);
+        }
+      });
+    }
+  });
+
   let currentMode = "csv";
   let cacheSoal = {};
 
@@ -943,6 +1068,7 @@ $paket = db()->query("
     const pill = e.target.closest(".mode-pill");
     if(!pill) return;
     setMode(pill.dataset.mode);
+    markDirty();
   });
 
   function clearJawabanRadio(){
@@ -962,6 +1088,7 @@ $paket = db()->query("
     const lab = e.target.closest(".ans-item");
     if(!lab) return;
     setJawabanRadio(lab.dataset.val);
+    markDirty();
   });
 
   function getJawabanVal(){
@@ -1005,6 +1132,7 @@ $paket = db()->query("
         nomorActive.value = String(i);
         loadDraft(i);
         buildNumbers();
+        markDirty();
       });
 
       numbers.appendChild(btn);
@@ -1028,7 +1156,18 @@ $paket = db()->query("
 
     buildNumbers();
     setMode("csv");
+
+    clearDirty();
+    allowSubmit = false;
   }
+
+  judulPaketInput.addEventListener("input", markDirty);
+  bagianInput.addEventListener("change", markDirty);
+  pertanyaanInput.addEventListener("input", markDirty);
+  opsiA.addEventListener("input", markDirty);
+  opsiB.addEventListener("input", markDirty);
+  opsiC.addEventListener("input", markDirty);
+  opsiD.addEventListener("input", markDirty);
 
   csvDrop.addEventListener("click", ()=> csvInput.click());
   csvDrop.addEventListener("dragover", (e)=>{ e.preventDefault(); csvDrop.classList.add("dragover"); });
@@ -1039,10 +1178,14 @@ $paket = db()->query("
     if(e.dataTransfer.files && e.dataTransfer.files[0]){
       csvInput.files = e.dataTransfer.files;
       csvName.textContent = e.dataTransfer.files[0].name;
+      markDirty();
     }
   });
   csvInput.addEventListener("change", ()=>{
-    if(csvInput.files && csvInput.files[0]) csvName.textContent = csvInput.files[0].name;
+    if(csvInput.files && csvInput.files[0]) {
+      csvName.textContent = csvInput.files[0].name;
+      markDirty();
+    }
   });
 
   btnOpenAdd.addEventListener("click", ()=>{
@@ -1086,6 +1229,7 @@ $paket = db()->query("
           buildNumbers();
 
           setMode("manual");
+          clearDirty();
         }
       }catch(e){}
 
@@ -1101,24 +1245,50 @@ $paket = db()->query("
     return re.test(t);
   }
 
-  document.getElementById("kuisForm").addEventListener("submit", (e)=>{
+  const formEl = document.getElementById("kuisForm");
+  formEl.addEventListener("submit", (e)=>{
+    if (allowSubmit) return;
+
+    e.preventDefault();
+
     const judul = judulPaketInput.value || "";
     if(!isJudulValid(judul)){
-      e.preventDefault();
-      alert("Judul tidak sesuai aturan.\n- Maksimal 45 karakter (termasuk spasi)\n- Hanya boleh: huruf, angka, spasi, titik (.), koma (,), titik dua (:), tanda tanya (?)");
+      showError(
+        "Judul tidak sesuai aturan.\n" +
+        "- Maksimal 45 karakter (termasuk spasi)\n" +
+        "- Hanya boleh: huruf, angka, spasi, titik (.), koma (,), titik dua (:), tanda tanya (?)"
+      );
       return;
     }
 
     if(currentMode === "csv"){
       actionInput.value = "csv_import";
-      return;
+    } else {
+      saveDraft();
+      actionInput.value = "soal_save_bulk";
+      bulkJsonInput.value = JSON.stringify(cacheSoal);
     }
-    saveDraft();
-    actionInput.value = "soal_save_bulk";
-    bulkJsonInput.value = JSON.stringify(cacheSoal);
+
+    showConfirm({
+      title: "Konfirmasi",
+      message: "Yakin ingin disimpan?",
+      okText: "Simpan",
+      cancelText: "Batal",
+      onOk: () => {
+        allowSubmit = true;
+        clearDirty();
+        formEl.submit();
+      }
+    });
   });
 
   resetForm();
+
+  <?php if ($toast["type"] === "danger"): ?>
+    window.addEventListener("DOMContentLoaded", () => {
+      showError(<?= json_encode((string)$toast["msg"], JSON_UNESCAPED_UNICODE) ?>);
+    });
+  <?php endif; ?>
 </script>
 
 <?php include 'footer.php'; ?>
